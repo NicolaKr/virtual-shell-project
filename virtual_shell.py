@@ -281,7 +281,5 @@ def main():
 
 
 if __name__ == "__main__":
-    env = VirtualEnvironment()
-    shell = Shell(env)
     print("Finished Environment Exists")
     #main()
