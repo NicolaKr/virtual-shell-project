@@ -450,12 +450,12 @@ class ScriptInterpreter:
 
         for cond, body in clauses:
             if cond is None:
-                # else branch – always execute
+                # else branch – only reached if no earlier branch matched
                 self.run_lines(body)
                 return
             if self._eval_condition(cond):
                 self.run_lines(body)
-                return
+                return # ← critical: stop after first matching branch
 
     # ---- condition evaluator ----
 
@@ -489,14 +489,21 @@ class ScriptInterpreter:
     def _eval_test(self, expr: str) -> bool:
         expr = expr.strip()
 
+        def unquote(s):
+            s = s.strip()
+            if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+                return s[1:-1]
+            return s
+
         # string comparisons
         for op in ("!=", "==", "="):
-            parts = expr.split(op, 1)
-            if len(parts) == 2:
-                l, r = parts[0].strip(), parts[1].strip()
-                if op in ("==", "="):
-                    return l == r
-                return l != r
+            if op in expr:
+                parts = expr.split(op, 1)
+                if len(parts) == 2:
+                    l, r = unquote(parts[0]), unquote(parts[1])
+                    if op in ("==", "="):
+                        return l == r
+                    return l != r
 
         # numeric comparisons
         for op, fn in [("-eq", lambda a, b: a == b), ("-ne", lambda a, b: a != b),
@@ -505,7 +512,7 @@ class ScriptInterpreter:
             if op in expr:
                 parts = expr.split(op, 1)
                 try:
-                    a, b = int(parts[0].strip()), int(parts[1].strip())
+                    a, b = int(unquote(parts[0])), int(unquote(parts[1]))
                     return fn(a, b)
                 except ValueError:
                     return False
@@ -513,7 +520,7 @@ class ScriptInterpreter:
         # file tests
         m = re.match(r"^(-[efdszrwx])\s+(.+)$", expr)
         if m:
-            flag, path = m.group(1), m.group(2)
+            flag, path = m.group(1), unquote(m.group(2))
             try:
                 node = self.shell.resolve_path(path)
                 if flag == "-e": return True
@@ -528,7 +535,7 @@ class ScriptInterpreter:
         # -z (empty string)  -n (non-empty string)
         m = re.match(r"^(-z|-n)\s+(.*)$", expr)
         if m:
-            flag, val = m.group(1), m.group(2).strip('"\'')
+            flag, val = m.group(1), unquote(m.group(2))
             if flag == "-z": return len(val) == 0
             if flag == "-n": return len(val) > 0
 
@@ -537,7 +544,7 @@ class ScriptInterpreter:
             return not self._eval_test(expr[2:])
 
         # fallback: non-empty string = true
-        return bool(expr)
+        return bool(unquote(expr))
 
     # ---- for loop ----
 
