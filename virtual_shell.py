@@ -317,6 +317,23 @@ class ScriptInterpreter:
         while i < len(lines):
             line = lines[i].strip()
             m = re.match(r"^(\w+)\s*\(\s*\)\s*\{?\s*$", line)
+
+            # Single-line:  name() { body; }  or  function name() { body; }
+            m_single = re.match(
+                r"^(?:function\s+)?(\w+)\s*\(\s*\)\s*\{(.+)\}\s*$", line
+            )
+            if m_single:
+                fname = m_single.group(1)
+                body_text = m_single.group(2).strip()
+                # split body on semicolons to get individual statements
+                body_lines = [b.strip() for b in body_text.split(";") if b.strip()]
+                self._functions[fname] = body_lines
+                i += 1
+                continue
+
+            # Multi-line:  name() {  or  function name() {  or  name() on its own line
+            m = re.match(r"^(?:function\s+)?(\w+)\s*\(\s*\)\s*\{?\s*$", line)
+
             if m:
                 fname = m.group(1)
                 body = []
@@ -692,12 +709,23 @@ class ScriptInterpreter:
             return
 
         # function call
-        cmd_name = shlex.split(self._expand(line))[0] if line else ""
+        try:
+            call_parts = shlex.split(self._expand(line))
+        except Exception:
+            call_parts = line.split()
+        cmd_name = call_parts[0] if call_parts else ""
+        call_args = call_parts[1:] if len(call_parts) > 1 else []
+
         if cmd_name in self._functions:
             fn_lines = self._functions[cmd_name]
             sub = ScriptInterpreter(self.shell)
             sub._functions = dict(self._functions)
             sub._local_vars = dict(self._local_vars)
+            # inject positional args
+            for idx, arg in enumerate(call_args, 1):
+                sub._local_vars[str(idx)] = arg
+            sub._local_vars["@"] = " ".join(call_args)
+            sub._local_vars["#"] = str(len(call_args))
             sub.run_lines(fn_lines)
             self.env.last_exit_code = sub._return_value or 0
             return
@@ -797,9 +825,12 @@ class ScriptInterpreter:
             name = m.group(1)
             if name == "?":
                 return str(self.env.last_exit_code)
-            return str(self.env.vars.get(name, self._local_vars.get(name, "")))
+            # positional / special params live in _local_vars
+            if name in self._local_vars:
+                return str(self._local_vars[name])
+            return str(self.env.vars.get(name, ""))
 
-        text = re.sub(r"\$([A-Za-z_?]\w*)", expand_var, text)
+        text = re.sub(r"\$([A-Za-z_?]\w*|\d+)", expand_var, text)
 
         # strip surrounding quotes
         if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
