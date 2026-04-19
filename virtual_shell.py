@@ -951,6 +951,7 @@ class Shell:
             self.commands[cmd.name] = cmd
 
         self._aliases: dict[str, str] = {}
+        self._ls_capture_mode: bool = False
         self._processes = [
             {"pid": 1, "user": "root", "cpu": 0.0, "mem": 0.1, "cmd": "init"},
             {"pid": 423, "user": "root", "cpu": 0.0, "mem": 0.3, "cmd": "sshd"},
@@ -1084,10 +1085,13 @@ class Shell:
                 buf = io.StringIO()
                 old = sys.stdout
                 sys.stdout = buf
+                if cmd == "ls":
+                    self._ls_capture_mode = True
                 try:
                     self.commands[cmd].fn(args)
                 finally:
                     sys.stdout = old
+                    self._ls_capture_mode = False
                 return buf.getvalue()
             else:
                 self.commands[cmd].fn(args)
@@ -1157,6 +1161,7 @@ class Shell:
                 try:
                     node = self._get_or_create_file(args[0])
                     node.content = stdin_text
+                    node.mtime = datetime.datetime.now().strftime("%b %d %H:%M")
                 except Exception as e:
                     print(f"tee: {e}")
             print(stdin_text, end="")
@@ -1213,7 +1218,24 @@ class Shell:
         if len(args) < 2:
             print(text, end="")
             return
-        table = str.maketrans(args[0], args[1])
+        def expand_range(s):
+            result = ""
+            i = 0
+            while i < len(s):
+                if i + 2 < len(s) and s[i + 1] == "-":
+                    start, end = ord(s[i]), ord(s[i + 2])
+                    result += "".join(chr(c) for c in range(start, end + 1))
+                    i += 3
+                else:
+                    result += s[i]
+                    i += 1
+            return result
+
+        set1 = expand_range(args[0])
+        set2 = expand_range(args[1])
+        # maketrans requires equal-length strings
+        min_len = min(len(set1), len(set2))
+        table = str.maketrans(set1[:min_len], set2[:min_len])
         print(text.translate(table), end="")
 
     def _pipe_cut(self, text, args):
@@ -1221,9 +1243,19 @@ class Shell:
         fields = []
         i = 0
         while i < len(args):
-            if args[i] == "-d" and i + 1 < len(args):
+            if args[i].startswith("-d") and len(args[i]) > 2:
                 delim = args[i + 1]
                 i += 2
+            elif args[i] == "-d" and i + 1 < len(args):
+                delim = args[i + 1]
+                i += 2
+            elif args[i].startswith("-f") and len(args[i]) > 2:
+                # e.g. "-f2"
+                try:
+                    fields = [int(f) - 1 for f in args[i][2:].split(",")]
+                except ValueError:
+                    pass
+                i += 1
             elif args[i] == "-f" and i + 1 < len(args):
                 try:
                     fields = [int(f) - 1 for f in args[i + 1].split(",")]
@@ -1232,6 +1264,8 @@ class Shell:
                 i += 2
             else:
                 i += 1
+        if not text.strip():
+            return
         for line in text.splitlines():
             parts = line.split(delim)
             selected = [parts[f] for f in fields if f < len(parts)]
@@ -1409,7 +1443,10 @@ class Shell:
         else:
             # colorize dirs (simulate) by adding / suffix
             names = [n.name + ("/" if n.is_dir else "") for n in entries]
-            print("  ".join(names))
+            if self._ls_capture_mode:
+                print("\n".join(names))
+            else:
+                print("  ".join(names))
 
     def _ls_long_line(self, node: Node):
         kind    = "d" if node.is_dir else "-"
