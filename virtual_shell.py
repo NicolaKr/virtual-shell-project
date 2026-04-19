@@ -1,8 +1,46 @@
+"""
+virtual_shell.py  –  A fully-featured virtual Linux shell for the Cyber Lab CTF.
+
+Structure
+─────────
+  Node               – one inode in the in-memory filesystem tree
+  VirtualEnvironment – filesystem tree + network topology + env vars
+  ScriptInterpreter  – Bash-like script engine (if/for/while/functions/pipes)
+  Shell              – interactive command dispatcher + all built-in commands
+  main()             – REPL with readline history, tab-completion, Ctrl+C
+
+Pipe chains  (CHANGED/FIXED in latest version)
+────────────────────────────────────────────────
+  cmd1 | cmd2 | cmd3  now works correctly for any number of stages.
+  Each stage captures its stdout and feeds it to the next stage as stdin.
+
+mtime  (CHANGED in latest version)
+────────────────────────────────────
+  Node.mtime is now a datetime.datetime object (was a static string).
+  Node.mtime_str  → formatted string for ls -l / stat output
+  Node.touch_mtime()  → update to now; called by every write operation
+    (nano save, >, >>, touch, mv, wget, curl -o, tee)
+
+Nano editor  (CHANGED in latest version)
+─────────────────────────────────────────
+  Uses Python curses for a real full-screen editor with arrow-key movement.
+  Falls back to the old prompt-based line editor when curses is unavailable.
+
+readline integration  (CHANGED in latest version)
+──────────────────────────────────────────────────
+  Arrow ↑/↓  navigate command history
+  Tab         autocomplete command names (first word) or paths (later words)
+  Ctrl+C      at prompt: clear line (like bash); during command: cancel
+  Ctrl+D      exit the shell
+"""
+
 import shlex
 import time
 import re
 import random
 import datetime
+import curses
+import readline
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 import io
@@ -21,13 +59,26 @@ class Node:
         self.permissions = permissions or ("rwxr-xr-x" if is_dir else "rw-r--r--")
 
         self.children = {}
-        self.mtime = "Apr 10 12:34"
+        self.mtime = datetime.datetime.now()
 
     @property
     def size(self):
         if self.is_dir:
             return 4096
         return len(self.content.encode())
+
+    @property
+    def mtime_str(self):
+        """
+        Shows 'Mon DD HH:MM' for current year, 'Mon DD  YYYY' for older files.
+        """
+        now = datetime.datetime.now()
+        if self.mtime.year == now.year:
+            return self.mtime.strftime("%b %d %H:%M")
+        return self.mtime.strftime("%b %d  %Y")
+
+    def touch_mtime(self) -> None:
+        self.mtime = datetime.datetime.now()
 
     def permission_bits(self):
         """Return integer permission bits from rwx string."""
@@ -984,12 +1035,26 @@ class Shell:
 
         # pipe  a | b  (only two-command pipes)
         if "|" in line and "||" not in line:
-            left, right = line.split("|", 1)
-            output = self._run_single(left.strip(), capture=True)
-            self._run_piped(right.strip(), output or "")
+            segments = line.split("|")
+            # Stage 0: run first command, capture its stdout
+            output = self._run_single(segments[0].strip(), capture=True) or ""
+            # Stages 1..N-1: pipe captured output through each subsequent command,
+            # capturing again so the next stage receives it
+            for seg in segments[1:-1]:
+                buf = io.StringIO()
+                old_stdout = sys.stdout
+                sys.stdout = buf
+                try:
+                    self._run_piped(seg.strip(), output)
+                finally:
+                    sys.stdout = old_stdout
+                output = buf.getvalue()
+            # Last stage: run normally so output goes to the terminal
+            self._run_piped(segments[-1].strip(), output)
             return
 
         # logical AND (split before pipe/redir so each segment is handled alone)
+        # logical AND – run each part; stop if any part fails
         if "&&" in line:
             parts = line.split("&&")
             for p in parts:
@@ -998,31 +1063,13 @@ class Shell:
                     break
             return
 
-        # logical OR
+        # logical OR – run right side only when left side fails
         if "||" in line:
             parts = line.split("||", 1)
             self.run(parts[0].strip())
             if self.env.last_exit_code != 0:
                 self.run(parts[1].strip())
             return
-
-        if "|" in line and "||" not in line:
-            segments = line.split("|")
-            # run first segment, capture output
-            output = self._run_single(segments[0].strip(), capture=True) or ""
-            # pipe through middle and last segments
-            for seg in segments[1:]:
-                buf = io.StringIO()
-                old = sys.stdout
-                sys.stdout = buf
-                try:
-                    self._run_piped(seg.strip(), output)
-                finally:
-                    sys.stdout = old
-                output = buf.getvalue()
-            print(output, end="")
-            return
-
 
         # output redirection at the shell level
         redir = re.search(r"\s+(2>&1|&>>|&>|>>|2>|>)\s+(\S+)\s*$", line)
@@ -1036,7 +1083,7 @@ class Shell:
                     node.content += output
                 else:
                     node.content = output
-                node.mtime = datetime.datetime.now().strftime("%b %d %H:%M")
+                node.touch_mtime()
             except Exception as e:
                 print(f"bash: {e}")
             return
@@ -1161,7 +1208,7 @@ class Shell:
                 try:
                     node = self._get_or_create_file(args[0])
                     node.content = stdin_text
-                    node.mtime = datetime.datetime.now().strftime("%b %d %H:%M")
+                    node.touch_mtime()
                 except Exception as e:
                     print(f"tee: {e}")
             print(stdin_text, end="")
@@ -1239,29 +1286,40 @@ class Shell:
         print(text.translate(table), end="")
 
     def _pipe_cut(self, text, args):
+        """
+        Handles:  -d:   (delimiter glued to flag)
+                  -d :  (delimiter as next arg)
+                  -f2   (field glued to flag)
+                  -f 2  (field as next arg)
+                  -f 1,3 (multiple comma-separated fields)
+        """
         delim = "\t"
         fields = []
         i = 0
         while i < len(args):
-            if args[i].startswith("-d") and len(args[i]) > 2:
+            a = args[i]
+            if a == "-d" and i + 1 < len(args):
+                # delimiter is the next standalone argument: -d :
                 delim = args[i + 1]
                 i += 2
-            elif args[i] == "-d" and i + 1 < len(args):
-                delim = args[i + 1]
-                i += 2
-            elif args[i].startswith("-f") and len(args[i]) > 2:
-                # e.g. "-f2"
-                try:
-                    fields = [int(f) - 1 for f in args[i][2:].split(",")]
-                except ValueError:
-                    pass
+            elif a.startswith("-d") and len(a) > 2:
+                # delimiter glued: -d:
+                delim = a[2:]
                 i += 1
-            elif args[i] == "-f" and i + 1 < len(args):
+            elif a == "-f" and i + 1 < len(args):
+                # field spec is next argument: -f 2
                 try:
                     fields = [int(f) - 1 for f in args[i + 1].split(",")]
                 except ValueError:
                     pass
                 i += 2
+            elif a.startswith("-f") and len(a) > 2:
+                # field glued: -f2
+                try:
+                    fields = [int(f) - 1 for f in a[2:].split(",")]
+                except ValueError:
+                    pass
+                i += 1
             else:
                 i += 1
         if not text.strip():
@@ -1449,13 +1507,12 @@ class Shell:
                 print("  ".join(names))
 
     def _ls_long_line(self, node: Node):
-        kind    = "d" if node.is_dir else "-"
-        perms   = kind + node.permissions
-        nlinks  = len(node.children) + 2 if node.is_dir else 1
-        owner   = node.owner
-        size    = node.size
-        mtime   = node.mtime
-
+        kind = "d" if node.is_dir else "-"
+        perms = kind + node.permissions
+        nlinks = len(node.children) + 2 if node.is_dir else 1
+        owner = node.owner
+        size = node.size
+        mtime = node.mtime_str
         print(f"{perms}  {nlinks:2}  {owner:<8} {owner:<8} {size:6}  {mtime}  {node.name}")
 
     def cd(self, args):
@@ -1544,6 +1601,9 @@ class Shell:
             node = node.children[p]
 
     def touch(self, args):
+        """
+        Create an empty file, or if it already exists just update its mtime.
+        """
         if not args:
             print("usage: touch <file>"); return
         for path in args:
@@ -1555,6 +1615,9 @@ class Shell:
                     parent = self.resolve_path(head)
                 if name not in parent.children:
                     parent.children[name] = Node(name, parent, is_dir=False, content="", owner=self.env.user)
+                else:
+                    # touch existing file: update mtime
+                    parent.children[name].touch_mtime()
                 self.env.last_exit_code = 0
             except FileNotFoundError as e:
                 print(f"touch: {e}")
@@ -1648,6 +1711,7 @@ class Shell:
         src.name   = dest_name
         src.parent = dest_parent
         dest_parent.children[dest_name] = src
+        src.touch_mtime()
         self.env.last_exit_code = 0
 
     def grep(self, args):
@@ -1991,7 +2055,8 @@ class Shell:
         print(f"Device: sda1  Inode: {abs(hash(node.name)) % 99999}  Links: 1")
         print(
             f"Access: ({perm:04o}/{('d' if node.is_dir else '-')}{node.permissions})  Uid: (1000/{node.owner})  Gid: (1000/{node.owner})")
-        print(f"Modify: 2025-04-10 12:34:00.000000000 +0000")
+        mtime_str = node.mtime.strftime("%Y-%m-%d %H:%M:%S.000000000 +0000")
+        print(f"Modify: {mtime_str}")
         self.env.last_exit_code = 0
 
     def du(self, args):
@@ -2046,17 +2111,6 @@ class Shell:
             node = self.resolve_path(path)
         except FileNotFoundError as e:
             print(f"chmod: cannot access '{path}': No such file or directory"); return
-
-        if re.fullmatch(r"[0-7]{3}", mode_str):
-            p = ""
-            for digit in mode_str:
-                d = int(digit)
-                p += ("r" if d & 4 else "-")
-                p += ("w" if d & 2 else "-")
-                p += ("x" if d & 1 else "-")
-            node.permissions = p
-            self.env.last_exit_code = 0
-            return
 
         if re.fullmatch(r"[0-7]{3}", mode_str):
             p = ""
@@ -2374,9 +2428,26 @@ class Shell:
         self.env.last_exit_code = 0
 
     # =====================================================
-    # NANO EDITOR  (improved)
+    # NANO EDITOR
     # =====================================================
     def nano(self, args):
+        """
+        Open a file in the interactive text editor.
+
+        Controls (inside nano):
+          Arrow keys   – move cursor up / down / left / right
+          Home / End   – jump to start or end of line
+          PgUp / PgDn  – scroll one screen
+          Enter        – insert new line
+          Backspace    – delete character before cursor
+          Delete       – delete character under cursor
+          Ctrl+S       – save file
+          Ctrl+Q       – quit (asks to save if modified)
+          Ctrl+X       – same as Ctrl+Q
+          Ctrl+K       – cut (delete) current line, hold in clipboard
+          Ctrl+U       – paste (uncut) clipboard before current line
+          Ctrl+G       – show help bar
+        """
         if not args:
             print("usage: nano <filename>"); return
 
@@ -2392,120 +2463,290 @@ class Shell:
             parent = self.env.cwd
             name   = parts[0]
 
-        # Load existing content
+        # Load existing content into a list of lines
         if name in parent.children and not parent.children[name].is_dir:
-            existing = parent.children[name].content
+            lines = parent.children[name].content.splitlines()
         else:
-            existing = ""
+            lines = []
+        if not lines:
+            lines = [""]  # always at least one line so the cursor has somewhere to sit
 
-        ext = filename.rsplit(".", 1)[-1] if "." in filename else ""
-        hints = {
-            "py": "Python", "sh": "Shell script", "txt": "Text",
-            "md": "Markdown", "json": "JSON", "js": "JavaScript",
-            "html": "HTML", "css": "CSS", "c": "C", "cpp": "C++",
-            "rs": "Rust", "go": "Go", "yaml": "YAML", "rb": "Ruby",
-        }
-        hint = hints.get(ext, "File")
-        lines = existing.splitlines()
+        result_lines = self._nano_curses(filename, lines[:])
 
-        print(f"\n  nano — {hint}: {filename}")
-        print("  ─────────────────────────────────────────────────────")
-        print("  Commands:  :wq save & quit  |  :q! cancel  |  :a append mode")
-        print("             N: <text>  edit line N  |  :d N  delete line N")
-        print("             :i N <text>  insert before line N")
-        print("  ─────────────────────────────────────────────────────\n")
 
-        def show_buffer():
-            if not lines:
-                print("  (empty file)")
-            else:
-                for i, ln in enumerate(lines, 1):
-                    print(f"  {i:3} | {ln}")
-            print()
+        if result_lines is None:
+            # User cancelled (Ctrl+Q without saving)
+            return
 
-        show_buffer()
-
-        while True:
-            try:
-                raw = input("  nano> ").rstrip("\n")
-            except EOFError:
-                break
-
-            # ---- quit commands ----
-            if raw.strip() == ":wq":
-                break
-            if raw.strip() == ":q!":
-                print("  cancelled — no changes saved")
-                return
-
-            # ---- show current state ----
-            if raw.strip() in (":s", ":show", ":l", ":list"):
-                show_buffer()
-                continue
-
-            # ---- delete line  :d N ----
-            m = re.fullmatch(r":d\s+(\d+)", raw.strip())
-            if m:
-                idx = int(m.group(1)) - 1
-                if 0 <= idx < len(lines):
-                    removed = lines.pop(idx)
-                    print(f"  deleted line {idx+1}: {removed}")
-                else:
-                    print(f"  error: line {idx+1} does not exist")
-                show_buffer(); continue
-
-            # ---- insert before line  :i N <text> ----
-            m = re.fullmatch(r":i\s+(\d+)\s+(.*)", raw.strip(), re.DOTALL)
-            if m:
-                idx  = int(m.group(1)) - 1
-                text = m.group(2)
-                lines.insert(max(0, idx), text)
-                print(f"  inserted before line {idx+1}")
-                show_buffer(); continue
-
-            # ---- append mode  :a ----
-            if raw.strip() == ":a":
-                print("  append mode — type lines, enter ':done' to finish\n")
-                while True:
-                    try:
-                        ln = input("  + ")
-                    except EOFError:
-                        break
-                    if ln.strip() == ":done":
-                        break
-                    lines.append(ln)
-                show_buffer(); continue
-
-            # ---- edit line  N: <new text> ----
-            m = re.fullmatch(r"(\d+):\s*(.*)", raw.strip(), re.DOTALL)
-            if m:
-                idx  = int(m.group(1)) - 1
-                text = m.group(2)
-                if 0 <= idx < len(lines):
-                    lines[idx] = text
-                    print(f"  updated line {idx+1}")
-                elif idx == len(lines):
-                    lines.append(text)
-                    print(f"  appended as line {idx+1}")
-                else:
-                    print(f"  error: line {idx+1} out of range (file has {len(lines)} lines)")
-                show_buffer(); continue
-
-            # ---- plain text → append ----
-            if raw:
-                lines.append(raw)
-                print(f"  appended line {len(lines)}")
-                continue
-
-        content = "\n".join(lines)
+        content = "\n".join(result_lines)
         if name in parent.children:
             parent.children[name].content = content
+            parent.children[name].touch_mtime()  # CHANGED: update real mtime
         else:
             parent.children[name] = Node(
-                name, parent, is_dir=False, content=content,
-                owner=self.env.user
+                name, parent, is_dir=False, content=content, owner=self.env.user
             )
-        print(f'\n  saved "{filename}" ({len(lines)} lines)\n')
+        print(f'  saved "{filename}" ({len(result_lines)} lines)')
+        self.env.last_exit_code = 0
+
+    # ------------------------------------------------------------------
+    # Curses-based nano implementation
+    # ------------------------------------------------------------------
+    def _nano_curses(self, filename: str, lines: list) -> list:
+        """
+        Full-screen curses editor.
+        Returns the edited list of lines, or None if user cancelled without saving.
+        CHANGED: completely new implementation replacing the old prompt-based editor.
+        """
+        # Shared mutable state passed into the curses wrapper
+        state = {
+            "lines": lines,
+            "cx": 0,  # cursor column  (index into line)
+            "cy": 0,  # cursor row     (index into lines)
+            "scroll": 0,  # first visible line index
+            "modified": False,
+            "saved": False,
+            "cancelled": False,
+            "clipboard": "",  # Ctrl+K clipboard
+            "msg": "",  # status-bar message
+        }
+
+        def _editor(stdscr):
+            curses.curs_set(1)
+            curses.use_default_colors()
+            # Try to use color if available
+            try:
+                curses.start_color()
+                curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)  # title bar
+                curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)  # status bar
+                has_color = True
+            except Exception:
+                has_color = False
+
+            def draw():
+                stdscr.erase()
+                rows, cols = stdscr.getmaxyx()
+                # ── title bar ──
+                title = f" nano: {filename} {'[modified]' if state['modified'] else ''}"
+                title = title[:cols - 1].ljust(cols - 1)
+                try:
+                    if has_color:
+                        stdscr.addstr(0, 0, title, curses.color_pair(1))
+                    else:
+                        stdscr.addstr(0, 0, title, curses.A_REVERSE)
+                except curses.error:
+                    pass
+
+                # ── text area ──
+                text_rows = rows - 3  # top bar + bottom bar + help bar
+                vis_lines = state["lines"][state["scroll"]: state["scroll"] + text_rows]
+                for row_i, line in enumerate(vis_lines):
+                    display = line[:cols - 1]
+                    try:
+                        stdscr.addstr(row_i + 1, 0, display)
+                    except curses.error:
+                        pass
+
+                # ── help bar ──
+                help_txt = " ^S Save  ^Q Quit  ^K Cut  ^U Paste  Arrows Move"
+                help_txt = help_txt[:cols - 1].ljust(cols - 1)
+                try:
+                    if has_color:
+                        stdscr.addstr(rows - 2, 0, help_txt, curses.color_pair(2))
+                    else:
+                        stdscr.addstr(rows - 2, 0, help_txt, curses.A_REVERSE)
+                except curses.error:
+                    pass
+
+                # ── status bar ──
+                line_info = f" Ln {state['cy'] + 1}/{len(state['lines'])}  Col {state['cx'] + 1}"
+                status_msg = (state["msg"] or line_info)[:cols - 1].ljust(cols - 1)
+                try:
+                    stdscr.addstr(rows - 1, 0, status_msg[:cols - 1])
+                except curses.error:
+                    pass
+                state["msg"] = ""  # clear one-shot message after displaying
+
+                # ── position cursor ──
+                vis_cy = state["cy"] - state["scroll"]
+                vis_cx = min(state["cx"], cols - 2)
+                try:
+                    stdscr.move(vis_cy + 1, vis_cx)
+                except curses.error:
+                    pass
+                stdscr.refresh()
+
+            def clamp():
+                """Keep cx/cy/scroll in valid range after any change."""
+                state["cy"] = max(0, min(state["cy"], len(state["lines"]) - 1))
+                max_cx = len(state["lines"][state["cy"]])
+                state["cx"] = max(0, min(state["cx"], max_cx))
+                rows, _ = stdscr.getmaxyx()
+                text_rows = rows - 3
+                if state["cy"] < state["scroll"]:
+                    state["scroll"] = state["cy"]
+                elif state["cy"] >= state["scroll"] + text_rows:
+                    state["scroll"] = state["cy"] - text_rows + 1
+
+            def save():
+                state["saved"] = True
+                state["modified"] = False
+                state["msg"] = " File saved."
+
+            while True:
+                draw()
+                try:
+                    key = stdscr.get_wch()
+                except curses.error:
+                    continue
+
+                rows, cols = stdscr.getmaxyx()
+                text_rows = rows - 3
+                cur_line = state["lines"][state["cy"]]
+
+                # ── navigation keys ──
+                if key == curses.KEY_UP:
+                    if state["cy"] > 0:
+                        state["cy"] -= 1
+                        state["cx"] = min(state["cx"], len(state["lines"][state["cy"]]))
+                    clamp()
+
+                elif key == curses.KEY_DOWN:
+                    if state["cy"] < len(state["lines"]) - 1:
+                        state["cy"] += 1
+                        state["cx"] = min(state["cx"], len(state["lines"][state["cy"]]))
+                    clamp()
+
+                elif key == curses.KEY_LEFT:
+                    if state["cx"] > 0:
+                        state["cx"] -= 1
+                    elif state["cy"] > 0:
+                        state["cy"] -= 1
+                        state["cx"] = len(state["lines"][state["cy"]])
+                    clamp()
+
+                elif key == curses.KEY_RIGHT:
+                    if state["cx"] < len(cur_line):
+                        state["cx"] += 1
+                    elif state["cy"] < len(state["lines"]) - 1:
+                        state["cy"] += 1
+                        state["cx"] = 0
+                    clamp()
+
+                elif key == curses.KEY_HOME or key == 1:  # Home or Ctrl+A
+                    state["cx"] = 0
+
+                elif key == curses.KEY_END or key == 5:  # End or Ctrl+E
+                    state["cx"] = len(cur_line)
+
+                elif key == curses.KEY_PPAGE:  # Page Up
+                    state["cy"] = max(0, state["cy"] - text_rows)
+                    state["scroll"] = max(0, state["scroll"] - text_rows)
+                    clamp()
+
+                elif key == curses.KEY_NPAGE:  # Page Down
+                    state["cy"] = min(len(state["lines"]) - 1, state["cy"] + text_rows)
+                    clamp()
+
+                # ── editing ──
+                elif key in (curses.KEY_BACKSPACE, 127, "\x7f"):
+                    if state["cx"] > 0:
+                        ln = state["lines"][state["cy"]]
+                        state["lines"][state["cy"]] = ln[:state["cx"] - 1] + ln[state["cx"]:]
+                        state["cx"] -= 1
+                    elif state["cy"] > 0:
+                        prev = state["lines"][state["cy"] - 1]
+                        state["cx"] = len(prev)
+                        state["lines"][state["cy"] - 1] = prev + state["lines"][state["cy"]]
+                        state["lines"].pop(state["cy"])
+                        state["cy"] -= 1
+                    state["modified"] = True
+                    clamp()
+
+                elif key == curses.KEY_DC:  # Delete key
+                    ln = state["lines"][state["cy"]]
+                    if state["cx"] < len(ln):
+                        state["lines"][state["cy"]] = ln[:state["cx"]] + ln[state["cx"] + 1:]
+                    elif state["cy"] < len(state["lines"]) - 1:
+                        state["lines"][state["cy"]] += state["lines"].pop(state["cy"] + 1)
+                    state["modified"] = True
+
+                elif key in ("\n", "\r", curses.KEY_ENTER, 10, 13):  # Enter
+                    ln = state["lines"][state["cy"]]
+                    state["lines"][state["cy"]] = ln[:state["cx"]]
+                    state["lines"].insert(state["cy"] + 1, ln[state["cx"]:])
+                    state["cy"] += 1
+                    state["cx"] = 0
+                    state["modified"] = True
+                    clamp()
+
+                # ── Ctrl+K: cut (delete) current line ──
+                elif key == "\x0b" or key == 11:
+                    state["clipboard"] = state["lines"].pop(state["cy"])
+                    if not state["lines"]:
+                        state["lines"] = [""]
+                    state["cy"] = min(state["cy"], len(state["lines"]) - 1)
+                    state["cx"] = min(state["cx"], len(state["lines"][state["cy"]]))
+                    state["modified"] = True
+                    state["msg"] = " Line cut to clipboard (Ctrl+U to paste)."
+                    clamp()
+
+                # ── Ctrl+U: paste clipboard ──
+                elif key == "\x15" or key == 21:
+                    if state["clipboard"]:
+                        state["lines"].insert(state["cy"], state["clipboard"])
+                        state["modified"] = True
+                        state["msg"] = " Pasted from clipboard."
+                    clamp()
+
+                # ── Ctrl+S: save ──
+                elif key in ("\x13", 19):
+                    save()
+
+                # ── Ctrl+Q or Ctrl+X: quit ──
+                elif key in ("\x11", 17, "\x18", 24):
+                    if state["modified"] and not state["saved"]:
+                        # Ask to save
+                        rows, cols = stdscr.getmaxyx()
+                        prompt = " Save before quitting? (y/n): "
+                        try:
+                            stdscr.addstr(rows - 1, 0, prompt.ljust(cols - 1))
+                            stdscr.refresh()
+                            curses.echo()
+                            ans_raw = stdscr.getstr(rows - 1, len(prompt), 3)
+                            curses.noecho()
+                            ans = ans_raw.decode("utf-8", errors="ignore").strip().lower()
+                        except Exception:
+                            ans = "n"
+                        if ans in ("y", "yes"):
+                            save()
+                    break
+
+                # ── Ctrl+G: help overlay ──
+                elif key in ("\x07", 7):
+                    state["msg"] = " ^S=Save ^Q=Quit ^K=CutLine ^U=Paste Arrows=Move"
+
+                # ── regular character ──
+                elif isinstance(key, str) and key.isprintable():
+                    ln = state["lines"][state["cy"]]
+                    state["lines"][state["cy"]] = ln[:state["cx"]] + key + ln[state["cx"]:]
+                    state["cx"] += 1
+                    state["modified"] = True
+                elif isinstance(key, int) and 32 <= key < 127:
+                    ch = chr(key)
+                    ln = state["lines"][state["cy"]]
+                    state["lines"][state["cy"]] = ln[:state["cx"]] + ch + ln[state["cx"]:]
+                    state["cx"] += 1
+                    state["modified"] = True
+
+        curses.wrapper(_editor)
+
+        if state["cancelled"]:
+            return None
+        # If user quit without ever saving: still return lines (caller will save)
+        # If user explicitly saved at least once OR just quit: return lines
+        return state["lines"]
+
 
     # =====================================================
     # NETWORK COMMANDS
@@ -2923,33 +3164,487 @@ class Shell:
     # =====================================================
     # HELP
     # =====================================================
+    # Detailed help entries: usage, description, flags, example, tip
+    HELP_DETAIL = {
+        "ls": {
+            "desc": "List directory contents.",
+            "flags": [
+                ("-l", "long format: permissions, owner, size, mtime"),
+                ("-a", "show hidden files (names starting with .)"),
+                ("-la", "combine long format and hidden files"),
+            ],
+            "examples": [
+                ("ls",            "list current directory"),
+                ("ls -l",         "long listing with permissions and sizes"),
+                ("ls -la /etc",   "long + hidden files in /etc"),
+            ],
+            "tip": "Directories are shown with a trailing /.  Use 'cd <dir>' to enter one.",
+        },
+        "cd": {
+            "desc": "Change the current working directory.",
+            "flags": [],
+            "examples": [
+                ("cd /etc",       "go to /etc"),
+                ("cd ..",         "go up one level"),
+                ("cd ~",          "go to home directory"),
+                ("cd -",          "go to previous directory (uses $OLDPWD)"),
+            ],
+            "tip": "After cd, run 'pwd' to confirm your new location.",
+        },
+        "pwd": {
+            "desc": "Print the full path of the current working directory.",
+            "flags": [],
+            "examples": [("pwd", "print current directory path")],
+            "tip": "The prompt already shows your location, but pwd gives you the full absolute path.",
+        },
+        "cat": {
+            "desc": "Print the contents of one or more files to the screen.",
+            "flags": [],
+            "examples": [
+                ("cat file.txt",          "print file.txt"),
+                ("cat /etc/passwd",       "print the system password file"),
+                ("cat file1.txt file2.txt","print two files one after the other"),
+            ],
+            "tip": "For long files use 'head', 'tail', or pipe through 'less'.",
+        },
+        "echo": {
+            "desc": "Print text to the screen. Variables are expanded automatically.",
+            "flags": [("-n", "omit the trailing newline")],
+            "examples": [
+                ("echo hello world",    "print 'hello world'"),
+                ("echo $HOME",          "print the value of the HOME variable"),
+                ("echo -n noline",      "print without a newline at the end"),
+                ("echo hey > file.txt", "write 'hey' into file.txt (redirection)"),
+            ],
+            "tip": "Combine with > or >> to write text into files.",
+        },
+        "grep": {
+            "desc": "Search for lines matching a pattern inside files (or piped input).",
+            "flags": [
+                ("-n", "show line numbers"),
+                ("-i", "case-insensitive match"),
+                ("-v", "invert: show lines that do NOT match"),
+                ("-r", "recursive: search all files under a directory"),
+                ("-c", "count matching lines instead of printing them"),
+            ],
+            "examples": [
+                ("grep root /etc/passwd",        "find lines containing 'root'"),
+                ("grep -n error /var/log/syslog","show line numbers for 'error'"),
+                ("grep -i warning /var/log/syslog","case-insensitive search"),
+                ("grep -v root /etc/passwd",     "lines that do NOT contain 'root'"),
+                ("cat file.txt | grep foo",      "search piped input"),
+            ],
+            "tip": "grep is one of the most powerful tools. Chain it with pipes: ls | grep .txt",
+        },
+        "find": {
+            "desc": "Search for files and directories by name or type.",
+            "flags": [
+                ("-name <pat>", "match filename with glob pattern (* and ?)"),
+                ("-type f",     "match only regular files"),
+                ("-type d",     "match only directories"),
+            ],
+            "examples": [
+                ("find /home -name '*.txt'", "find all .txt files under /home"),
+                ("find . -type d",           "find all directories below current dir"),
+                ("find /etc -name 'passwd'", "find file named exactly 'passwd'"),
+            ],
+            "tip": "Combine -name and -type for precise searches.",
+        },
+        "mkdir": {
+            "desc": "Create one or more directories.",
+            "flags": [("-p", "create parent directories as needed (no error if exists)")],
+            "examples": [
+                ("mkdir mydir",         "create mydir in current directory"),
+                ("mkdir -p a/b/c",      "create nested directories in one command"),
+            ],
+            "tip": "Always use -p when you are not sure if the parent exists.",
+        },
+        "rm": {
+            "desc": "Remove files or directories.",
+            "flags": [
+                ("-r", "recursive: remove a directory and everything inside it"),
+                ("-f", "force: no error if file does not exist"),
+            ],
+            "examples": [
+                ("rm file.txt",       "delete file.txt"),
+                ("rm -r mydir",       "delete a directory and all its contents"),
+                ("rm -f missing.txt", "silently ignore if file does not exist"),
+            ],
+            "tip": "There is no trash here – deleted files are gone forever!",
+        },
+        "cp": {
+            "desc": "Copy files or directories.",
+            "flags": [("-r", "recursive: copy a whole directory tree")],
+            "examples": [
+                ("cp a.txt b.txt",    "copy a.txt to b.txt"),
+                ("cp -r dir1 dir2",   "copy entire directory dir1 to dir2"),
+            ],
+            "tip": "The destination can be a directory: cp file.txt /tmp/ puts file.txt inside /tmp.",
+        },
+        "mv": {
+            "desc": "Move or rename files and directories.",
+            "flags": [],
+            "examples": [
+                ("mv old.txt new.txt",  "rename old.txt to new.txt"),
+                ("mv file.txt /tmp/",   "move file.txt into /tmp/"),
+            ],
+            "tip": "mv is both rename and move – it depends on whether the destination exists.",
+        },
+        "chmod": {
+            "desc": "Change file permissions (who can read/write/execute a file).",
+            "flags": [],
+            "examples": [
+                ("chmod +x script.sh",  "make script.sh executable"),
+                ("chmod 755 script.sh", "rwx for owner, rx for group+others"),
+                ("chmod 644 file.txt",  "rw for owner, r for group+others"),
+                ("chmod u-w file.txt",  "remove write permission from owner"),
+            ],
+            "tip": "Scripts must have +x before you can run them with ./script.sh or 'run'.",
+        },
+        "head": {
+            "desc": "Print the first N lines of a file (default: 10).",
+            "flags": [("-n N", "print the first N lines")],
+            "examples": [
+                ("head file.txt",      "first 10 lines"),
+                ("head -n 3 file.txt", "first 3 lines only"),
+            ],
+            "tip": "Useful to preview large files without printing everything.",
+        },
+        "tail": {
+            "desc": "Print the last N lines of a file (default: 10).",
+            "flags": [("-n N", "print the last N lines")],
+            "examples": [
+                ("tail file.txt",           "last 10 lines"),
+                ("tail -n 1 /var/log/syslog","only the very last log line"),
+            ],
+            "tip": "Use tail on log files to see the most recent entries.",
+        },
+        "wc": {
+            "desc": "Count lines, words, or characters in a file.",
+            "flags": [("-l","count lines"),("-w","count words"),("-c","count characters")],
+            "examples": [
+                ("wc file.txt",      "lines, words, chars"),
+                ("wc -l file.txt",   "just line count"),
+                ("cat f.txt | wc -l","count lines of piped input"),
+            ],
+            "tip": "Combine with pipes: ls | wc -l counts files in a directory.",
+        },
+        "sort": {
+            "desc": "Sort lines of text alphabetically or numerically.",
+            "flags": [("-r","reverse order"),("-n","numeric sort"),("-u","remove duplicates")],
+            "examples": [
+                ("sort file.txt",       "alphabetical sort"),
+                ("sort -r file.txt",    "reverse alphabetical"),
+                ("sort -n numbers.txt", "numeric sort (10 comes after 9)"),
+                ("cat f.txt | sort",    "sort piped input"),
+            ],
+            "tip": "sort | uniq is a classic combo to get unique sorted lines.",
+        },
+        "uniq": {
+            "desc": "Filter out adjacent duplicate lines. Usually used after sort.",
+            "flags": [("-c","prefix each line with its count")],
+            "examples": [
+                ("uniq file.txt",           "remove adjacent duplicates"),
+                ("cat f.txt | sort | uniq", "sort then deduplicate ALL duplicates"),
+                ("cat f.txt | sort | uniq -c","count occurrences of each unique line"),
+            ],
+            "tip": "uniq only collapses ADJACENT identical lines. Always sort first!",
+        },
+        "cut": {
+            "desc": "Cut specific columns/fields from each line of input.",
+            "flags": [
+                ("-d <char>","field delimiter character (default: TAB)"),
+                ("-f <N>",   "field number(s) to extract, 1-based"),
+            ],
+            "examples": [
+                ("cut -d: -f1 /etc/passwd",          "get usernames from passwd"),
+                ("echo 'a:b:c' | cut -d: -f2",       "extract 'b' from 'a:b:c'"),
+                ("echo 'a:b:c' | cut -d: -f1,3",     "extract 'a' and 'c'"),
+            ],
+            "tip": "Use -d to set your delimiter. CSV? use -d,   colon-separated? use -d:",
+        },
+        "pipe (|)": {
+            "desc": "Send the output of one command as input to the next.",
+            "flags": [],
+            "examples": [
+                ("cat file.txt | grep foo",          "search file for 'foo'"),
+                ("cat file.txt | sort | uniq",       "sort then deduplicate"),
+                ("ls | wc -l",                       "count files in directory"),
+                ("cat /etc/passwd | cut -d: -f1 | sort", "sorted usernames"),
+            ],
+            "tip": "You can chain as many commands as you like with |",
+        },
+        "echo (redirect)": {
+            "desc": "Redirection operators > and >> write command output to files.",
+            "flags": [],
+            "examples": [
+                ("echo hello > file.txt",    "write 'hello' to file.txt (overwrite)"),
+                ("echo world >> file.txt",   "append 'world' to file.txt"),
+                ("cat f1.txt > f2.txt",      "copy file using redirection"),
+                ("ls > listing.txt",         "save directory listing to file"),
+            ],
+            "tip": "> overwrites the file. >> appends. Both create the file if it doesn't exist.",
+        },
+        "ping": {
+            "desc": "Check if a remote host is reachable and measure latency.",
+            "flags": [("-c N","send only N packets (default 4)")],
+            "examples": [
+                ("ping 192.168.0.1",       "ping the gateway"),
+                ("ping -c 2 192.168.0.10", "send only 2 packets"),
+            ],
+            "tip": "Look at the rtt numbers: high values mean a slow or congested link.",
+        },
+        "scan": {
+            "desc": "Scan the virtual network and list all discovered hosts and open ports.",
+            "flags": [],
+            "examples": [
+                ("scan",             "scan entire 192.168.0.0/24 network"),
+                ("scan 192.168.0.1", "scan only hosts starting with that prefix"),
+            ],
+            "tip": "Note which ports are open – they tell you what services are running.",
+        },
+        "connect": {
+            "desc": "Connect to a network host via simulated SSH.",
+            "flags": [],
+            "examples": [
+                ("connect 192.168.0.1",  "connect to the gateway (no password)"),
+                ("connect 192.168.0.25", "connect to db-server (needs password)"),
+            ],
+            "tip": "Scan first to find hosts, then try to connect. Some require passwords!",
+        },
+        "ps": {
+            "desc": "Show a list of running processes.",
+            "flags": [("-aux","show all processes from all users")],
+            "examples": [
+                ("ps",      "show processes owned by current user"),
+                ("ps -aux",  "show all processes"),
+            ],
+            "tip": "Note the PID column – you need the PID to kill a process.",
+        },
+        "kill": {
+            "desc": "Terminate a running process by its PID.",
+            "flags": [("-9","SIGKILL – force kill, cannot be caught by the process")],
+            "examples": [
+                ("kill 1001",   "send SIGTERM to process 1001"),
+                ("kill -9 1001","force kill process 1001"),
+            ],
+            "tip": "Use ps first to find the PID of the process you want to stop.",
+        },
+        "export": {
+            "desc": "Set or display environment variables available to all commands.",
+            "flags": [],
+            "examples": [
+                ("export",              "list all current environment variables"),
+                ("export TARGET=192.168.0.25", "set TARGET variable"),
+                ("export PATH=$PATH:/mybin",   "add /mybin to the PATH"),
+            ],
+            "tip": "Variables set with 'export' persist for the whole session.",
+        },
+        "run": {
+            "desc": "Execute a shell script file. The file must have execute permission.",
+            "flags": [],
+            "examples": [
+                ("run myscript.sh",        "run a script in the current directory"),
+                ("run scripts/scan.sh",    "run a script in a subdirectory"),
+                ("run script.sh arg1 arg2","pass arguments accessible as $1 $2"),
+            ],
+            "tip": "Don't forget: chmod +x script.sh before running it!",
+        },
+        "nano": {
+            "desc": "Open the interactive text editor. Supports cursor movement and real editing.",
+            "flags": [],
+            "examples": [
+                ("nano file.txt",         "open or create file.txt for editing"),
+                ("nano scripts/scan.sh",  "edit a script"),
+            ],
+            "tip": (
+                "Controls inside nano:\n"
+                "  Arrow keys   – move cursor\n"
+                "  Ctrl+S       – save\n"
+                "  Ctrl+Q / Ctrl+X – quit\n"
+                "  Ctrl+K       – cut current line\n"
+                "  Ctrl+U       – paste cut line\n"
+                "  Ctrl+G       – show help inside nano"
+            ),
+        },
+        "stat": {
+            "desc": "Show detailed metadata about a file: size, permissions, and modification time.",
+            "flags": [],
+            "examples": [
+                ("stat file.txt",      "show file metadata"),
+                ("stat /etc/passwd",   "show metadata for the passwd file"),
+            ],
+            "tip": "The 'Modify' timestamp updates every time the file is written.",
+        },
+        "history": {
+            "desc": "Show a numbered list of previously entered commands.",
+            "flags": [],
+            "examples": [
+                ("history",    "show all history"),
+                ("history 10", "show last 10 commands"),
+            ],
+            "tip": "Press the UP arrow key to navigate through history interactively.",
+        },
+        "alias": {
+            "desc": "Create a shortcut name for a longer command.",
+            "flags": [],
+            "examples": [
+                ("alias",            "list all currently defined aliases"),
+                ("alias ll='ls -la'","create alias ll for ls -la"),
+                ("alias h='history'","short alias for history"),
+            ],
+            "tip": "Aliases only last for this session. Put them in a script and 'source' it to reload.",
+        },
+        "source": {
+            "desc": "Run a script file in the current shell. Variables set inside the script remain available.",
+            "flags": [],
+            "examples": [
+                ("source setup.sh",        "run setup.sh and keep its variables"),
+                ("source scripts/env.sh",  "load environment from a script"),
+            ],
+            "tip": "Unlike 'run', source shares the current shell's variables with the script.",
+        },
+        "test": {
+            "desc": "Evaluate a condition and set the exit code ($?) to 0 (true) or 1 (false).",
+            "flags": [
+                ("-f <file>","true if file exists and is a regular file"),
+                ("-d <file>","true if file exists and is a directory"),
+                ("-z <str>", "true if string is empty"),
+                ("-n <str>", "true if string is non-empty"),
+                ("-eq",      "numeric equal"),
+                ("-lt",      "numeric less-than"),
+                ("-gt",      "numeric greater-than"),
+            ],
+            "examples": [
+                ("test -f file.txt && echo yes",  "check if file exists"),
+                ("test -d /home && echo isdir",   "check if directory exists"),
+                ("test $X -eq 5 && echo five",    "check if variable equals 5"),
+            ],
+            "tip": "Inside scripts use [ ] as shorthand: [ -f file.txt ] is the same as test -f file.txt",
+        },
+        "printf": {
+            "desc": "Print formatted text. More powerful than echo for structured output.",
+            "flags": [],
+            "examples": [
+                ("printf '%s\n' foo bar baz", "print each word on its own line"),
+                ("printf 'Hello %s!\n' World","print 'Hello World!'"),
+                ("printf '%d + %d = %d\n' 1 2 3","numeric formatting"),
+            ],
+            "tip": "Use %s for strings, %d for integers. The format repeats for extra args.",
+        },
+        "curl": {
+            "desc": "Transfer data from a URL (like a web browser in the terminal).",
+            "flags": [
+                ("-s",       "silent: suppress progress output"),
+                ("-o <file>","save response to a file instead of printing it"),
+            ],
+            "examples": [
+                ("curl http://192.168.0.10",          "fetch the web server homepage"),
+                ("curl -o page.html http://192.168.0.10","save page to file"),
+                ("curl -s http://192.168.0.50:8080",  "silently fetch admin panel API"),
+            ],
+            "tip": "curl is great for exploring web services and APIs from the terminal.",
+        },
+        "ifconfig": {
+            "desc": "Show network interface configuration: IP address, MAC address, traffic stats.",
+            "flags": [],
+            "examples": [("ifconfig", "show all network interfaces")],
+            "tip": "Look at 'inet' to see your IP address. 'lo' is the loopback (127.0.0.1).",
+        },
+        "diff": {
+            "desc": "Compare two files line by line and show the differences.",
+            "flags": [],
+            "examples": [
+                ("diff file1.txt file2.txt", "show differences between two files"),
+            ],
+            "tip": "Lines starting with < are from file1, > are from file2.",
+        },
+        "man": {
+            "desc": "Display the manual page for a command.",
+            "flags": [],
+            "examples": [
+                ("man ls",    "manual for ls"),
+                ("man grep",  "manual for grep"),
+            ],
+            "tip": "You can also use 'help <command>' for a shorter quick reference.",
+        },
+    }
+
     def help(self, args=None):
-        if args and args[0] in self.commands:
-            cmd = self.commands[args[0]]
-            print(f"\n  {cmd.usage}")
-            print(f"  {cmd.description}\n")
+        """
+        'help <command>' prints detailed flags, examples, and tips.
+        """
+        if args:
+            cmd_name = args[0]
+            # Look up detailed entry first
+            if cmd_name in self.HELP_DETAIL:
+                detail = self.HELP_DETAIL[cmd_name]
+                # Also get the usage line from the Command object if it exists
+                usage = self.commands[cmd_name].usage if cmd_name in self.commands else cmd_name
+
+                print(f"\n  ╔══ {cmd_name} ══")
+                print(f"  ║  {detail['desc']}")
+                print(f"  ║")
+                print(f"  ║  USAGE:  {usage}")
+
+                if detail["flags"]:
+                    print(f"  ║")
+                    print(f"  ║  FLAGS:")
+                    for flag, fdesc in detail["flags"]:
+                        print(f"  ║    {flag:<16}  {fdesc}")
+
+                if detail["examples"]:
+                    print(f"  ║")
+                    print(f"  ║  EXAMPLES:")
+                    for ex_cmd, ex_desc in detail["examples"]:
+                        print(f"  ║    $ {ex_cmd}")
+                        print(f"  ║      → {ex_desc}")
+
+                if detail.get("tip"):
+                    print(f"  ║")
+                    # Handle multi-line tips
+                    for line in detail["tip"].splitlines():
+                        print(f"  ║  TIP: {line}" if line == detail["tip"].splitlines()[0] else f"  ║       {line}")
+
+                print(f"  ╚{'═' * 50}\n")
+
+            elif cmd_name in self.commands:
+                # Fallback for commands without a HELP_DETAIL entry
+                cmd = self.commands[cmd_name]
+                print(f"\n  {cmd.usage}")
+                print(f"  {cmd.description}\n")
+            else:
+                print(f"  No help available for '{cmd_name}'")
+                print(f"  Try: help  (to see all commands)")
         else:
-            print("\nAvailable commands:\n")
+            # Overview listing
+            print("\n  Cyber Shell Lab — Command Reference")
+            print("  " + "─" * 50)
+            print("  Tip: type  help <command>  for detailed help with examples\n")
             groups = {
-                "File System":   ["ls","cd","pwd","cat","nano","mkdir","touch","rm","cp","mv",
-                                   "grep","find","head","tail","wc","sort","uniq","cut","diff",
-                                   "chmod","chown","stat","du","df","file"],
-                "Text/Shell":    ["echo","printf","export","unset","read","alias","type",
-                                   "which","whoami","id","hostname","uname","uptime","date",
-                                   "history","sleep","true","false","test","env","printenv","xargs"],
-                "Process":       ["ps","kill","jobs"],
-                "Network":       ["ping","scan","connect","ifconfig","ip","netstat","curl","wget","traceroute","nslookup"],
-                "Scripting":     ["run","source","help","man","clear","exit"],
+                "File System": ["ls", "cd", "pwd", "cat", "nano", "mkdir", "touch", "rm", "cp", "mv",
+                                  "grep", "find", "head", "tail", "wc", "sort", "uniq", "cut", "diff",
+                                  "chmod", "chown", "stat", "du", "df", "file"],
+                "Text & Shell": ["echo", "printf", "export", "unset", "read", "alias", "type",
+                                   "which", "whoami", "id", "hostname", "uname", "uptime", "date",
+                                   "history", "sleep", "true", "false", "test", "env", "printenv", "xargs"],
+                "Process": ["ps", "kill", "jobs"],
+                "Network": ["ping", "scan", "connect", "ifconfig", "ip", "netstat",
+                              "curl", "wget", "traceroute", "nslookup"],
+                "Scripting": ["run", "source", "help", "man", "clear", "exit"],
             }
             for group, names in groups.items():
                 print(f"  {group}:")
                 for n in names:
                     if n in self.commands:
                         cmd = self.commands[n]
-                        print(f"    {cmd.usage:<40} {cmd.description}")
+                        marker = "✦" if n in self.HELP_DETAIL else " "
+                        print(f"    {marker} {cmd.usage:<38} {cmd.description}")
                 print()
+            print("  ✦ = detailed help available  (try: help grep)")
 
     def man_cmd(self, args):
+        """Show a man-page style entry. Delegates to help for detailed info."""
         if not args:
             print("What manual page do you want?"); return
         cmd_name = args[0]
@@ -2959,8 +3654,26 @@ class Shell:
             print(f"       {cmd_name} — {cmd.description}")
             print(f"\nSYNOPSIS")
             print(f"       {cmd.usage}")
-            print(f"\nDESCRIPTION")
-            print(f"       {cmd.description}.")
+            if cmd_name in self.HELP_DETAIL:
+                detail = self.HELP_DETAIL[cmd_name]
+                print(f"\nDESCRIPTION")
+                print(f"       {detail['desc']}")
+                if detail["flags"]:
+                    print(f"\nOPTIONS")
+                    for flag, fdesc in detail["flags"]:
+                        print(f"       {flag:<16}  {fdesc}")
+                if detail["examples"]:
+                    print(f"\nEXAMPLES")
+                    for ex_cmd, ex_desc in detail["examples"]:
+                        print(f"       $ {ex_cmd}")
+                        print(f"         {ex_desc}")
+                if detail.get("tip"):
+                    print(f"\nNOTES")
+                    for line in detail["tip"].splitlines():
+                        print(f"       {line}")
+            else:
+                print(f"\nDESCRIPTION")
+                print(f"       {cmd.description}.")
             print()
         else:
             print(f"No manual entry for {cmd_name}")
@@ -2970,29 +3683,107 @@ class Shell:
 # MAIN LOOP
 # =========================================================
 def main():
-    from virtual_shell import VirtualEnvironment, Shell
-
     env   = VirtualEnvironment()
     shell = Shell(env)
 
-    print(f"Cyber Shell Lab  |  type 'help' for commands")
-    print(f"Logged in as {env.user}@{env.hostname}\n")
+    print("╔══════════════════════════════════════════════════╗")
+    print("║         Cyber Shell Lab  –  Virtual Terminal     ║")
+    print("╠══════════════════════════════════════════════════╣")
+    print(f"   Logged in as  {env.user}@{env.hostname:<20} ")
+    print("║  Type  help   to see available commands          ║")
+    print("║  Arrow ↑/↓  history  |  Tab  autocomplete        ║")
+    print("╚══════════════════════════════════════════════════╝\n")
 
+    # ── readline: arrow-key history + tab completion ─────────────────
+    # CHANGED: was inside a try/except with a broken duplicate KeyboardInterrupt
+    # handler. Now cleanly configured before the loop.
+    try:
+
+        def _tab_completer(text, state):
+            """
+            Complete command names for the first token,
+            and filesystem paths for subsequent tokens.
+            CHANGED: context-aware: first word → commands, later words → files.
+            """
+            buf    = readline.get_line_buffer()
+            tokens = buf.lstrip().split()
+
+            # Decide what we are completing
+            if not tokens or (len(tokens) == 1 and not buf.endswith(" ")):
+                # Completing the command name
+                candidates = (
+                    list(shell.commands.keys()) +
+                    list(shell._aliases.keys())
+                )
+                matches = sorted(c for c in candidates if c.startswith(text))
+            else:
+                # Completing a filesystem path argument
+                try:
+                    if "/" in text:
+                        dir_part, file_part = text.rsplit("/", 1)
+                        base = shell.resolve_path(dir_part or "/")
+                        prefix = dir_part + "/"
+                    else:
+                        base       = env.cwd
+                        file_part  = text
+                        prefix     = ""
+
+                    if not base.is_dir:
+                        matches = []
+                    else:
+                        matches = sorted(
+                            prefix + nm + ("/" if nd.is_dir else "")
+                            for nm, nd in base.children.items()
+                            if nm.startswith(file_part)
+                        )
+                except Exception:
+                    matches = []
+
+            try:
+                return matches[state]
+            except IndexError:
+                return None
+
+        readline.set_completer(_tab_completer)
+        # On macOS readline is actually libedit; the bind syntax differs
+        if "libedit" in readline.__doc__ if readline.__doc__ else "":
+            readline.parse_and_bind("bind ^I rl_complete")
+        else:
+            readline.parse_and_bind("tab: complete")
+        readline.set_completer_delims(" \t\n;|&")
+        # Arrow-key history navigation is automatic once readline is imported
+        _rl = True
+    except ImportError:
+        _rl = False
+
+    # ── main REPL loop ────────────────────────────────────────────────
     while True:
         try:
-            path = shell.get_path(env.cwd)
+            path   = shell.get_path(env.cwd)
             prompt = f"{env.user}@{env.hostname}:{path}$ "
-            line = input(prompt)
-        except (EOFError, KeyboardInterrupt):
+            line   = input(prompt)
+        except EOFError:
+            # Ctrl+D – exit cleanly
             print("\nlogout")
             break
+        except KeyboardInterrupt:
+            # CHANGED: Ctrl+C at the prompt prints a blank line (like bash)
+            # but does NOT exit the shell.
+            print()
+            env.last_exit_code = 130
+            continue
 
-        if line.strip() == "exit":
+        if line.strip() in ("exit", "logout"):
             print("logout")
             break
 
         try:
             shell.run(line)
+        except KeyboardInterrupt:
+            # CHANGED: Ctrl+C while a command is running cancels it (prints ^C)
+            # and returns to the prompt, matching real bash behaviour.
+            print("^C")
+            env.last_exit_code = 130
         except SystemExit as e:
             print(f"logout (exit code {e.code})")
             break
