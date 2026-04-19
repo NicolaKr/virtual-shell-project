@@ -2,11 +2,11 @@ import shlex
 import time
 import re
 import random
+import datetime
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 import io
 import sys
-
 
 # =========================================================
 # FILE SYSTEM NODE
@@ -562,7 +562,23 @@ class ScriptInterpreter:
         # handle brace expansion  {1..5}
         items_str = self._brace_expand(items_str)
         # handle glob-like splits
-        items = shlex.split(items_str) if items_str.strip() else []
+        raw_items = shlex.split(items_str) if items_str.strip() else []
+
+        items = []
+        for token in raw_items:
+            if "*" in token or "?" in token:
+                # match against current directory children
+                ext_pat = re.escape(token).replace(r"\*", ".*").replace(r"\?", ".")
+                matched = sorted(
+                    n.name for n in self.env.cwd.children.values()
+                    if re.fullmatch(ext_pat, n.name) and not n.is_dir
+                )
+                if matched:
+                    items.extend(matched)
+                else:
+                    items.append(token)  # no match → keep literal (bash behaviour)
+            else:
+                items.append(token)
 
         # collect loop body (between do … done)
         body = []
@@ -964,7 +980,6 @@ class Shell:
             line = self._aliases[first_word] + line[len(first_word):]
 
         # ---- operator splitting: handle &&  ||  |  ----------------------
-        # We handle a single level of chaining; nested ops not supported.
 
         # pipe  a | b  (only two-command pipes)
         if "|" in line and "||" not in line:
@@ -973,11 +988,11 @@ class Shell:
             self._run_piped(right.strip(), output or "")
             return
 
-        # logical AND
+        # logical AND (split before pipe/redir so each segment is handled alone)
         if "&&" in line:
             parts = line.split("&&")
             for p in parts:
-                self._run_single(p.strip())
+                self.run(p.strip())
                 if self.env.last_exit_code != 0:
                     break
             return
@@ -985,10 +1000,28 @@ class Shell:
         # logical OR
         if "||" in line:
             parts = line.split("||", 1)
-            self._run_single(parts[0].strip())
+            self.run(parts[0].strip())
             if self.env.last_exit_code != 0:
-                self._run_single(parts[1].strip())
+                self.run(parts[1].strip())
             return
+
+        if "|" in line and "||" not in line:
+            segments = line.split("|")
+            # run first segment, capture output
+            output = self._run_single(segments[0].strip(), capture=True) or ""
+            # pipe through middle and last segments
+            for seg in segments[1:]:
+                buf = io.StringIO()
+                old = sys.stdout
+                sys.stdout = buf
+                try:
+                    self._run_piped(seg.strip(), output)
+                finally:
+                    sys.stdout = old
+                output = buf.getvalue()
+            print(output, end="")
+            return
+
 
         # output redirection at the shell level
         redir = re.search(r"\s+(2>&1|&>>|&>|>>|2>|>)\s+(\S+)\s*$", line)
@@ -1002,6 +1035,7 @@ class Shell:
                     node.content += output
                 else:
                     node.content = output
+                node.mtime = datetime.datetime.now().strftime("%b %d %H:%M")
             except Exception as e:
                 print(f"bash: {e}")
             return
@@ -1267,10 +1301,33 @@ class Shell:
     # PATH HELPERS
     # =====================================================
     def resolve_path(self, path: str) -> Node:
+        # if path in ("~", f"/home/{self.env.user}"):
+        #     return self.env.root.children.get("home", self.env.root)
+        # Note: in this virtual FS, files live directly under /home (not /home/student).
+        home_path = self.env.vars.get("HOME", "/home/student")
+        # Normalise HOME to the actual node that exists
+        # Walk from root to find the deepest existing node matching HOME
+        def _home_node():
+            parts = home_path.strip("/").split("/")
+            node = self.env.root
+            for p in parts:
+                if p in getattr(node, "children", {}):
+                    node = node.children[p]
+                else:
+                    # parent dir exists but leaf doesn't – return parent
+                    break
+            return node
+
+        if path.startswith("~/"):
+            # replace ~ with the actual home node path
+            home_node = _home_node()
+            home_abs  = self.get_path(home_node)
+            path = home_abs.rstrip("/") + "/" + path[2:]
+        elif path == "~":
+            return _home_node()
+
         if not path or path == ".":
             return self.env.cwd
-        if path in ("~", f"/home/{self.env.user}"):
-            return self.env.root.children.get("home", self.env.root)
 
         node = self.env.root if path.startswith("/") else self.env.cwd
         parts = path.lstrip("/").split("/") if path.startswith("/") else path.split("/")
@@ -1519,16 +1576,20 @@ class Shell:
         self.env.last_exit_code = 0
 
     def _cp_node(self, src: Node, dest_parent: Node, dest_name: str):
+        real_mtime = datetime.datetime.now().strftime("%b %d %H:%M")
         if src.is_dir:
             new_dir = Node(dest_name, dest_parent, is_dir=True, owner=self.env.user)
+            new_dir.mtime = real_mtime
             dest_parent.children[dest_name] = new_dir
             for child in src.children.values():
                 self._cp_node(child, new_dir, child.name)
         else:
-            dest_parent.children[dest_name] = Node(
+            new_node = Node(
                 dest_name, dest_parent, is_dir=False,
                 content=src.content, permissions=src.permissions, owner=self.env.user
             )
+            new_node.mtime = real_mtime
+            dest_parent.children[dest_name] = new_node
 
     def mv(self, args):
         if len(args) < 2:
