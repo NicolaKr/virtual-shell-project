@@ -1748,40 +1748,56 @@ class Shell:
         rest = args[1:]
         # basic format specifiers
         try:
-            # replace %s, %d, etc.
-            out = ""
-            i = 0
-            arg_i = 0
-            while i < len(fmt):
-                if fmt[i] == "%" and i+1 < len(fmt):
-                    spec = fmt[i+1]
-                    val = rest[arg_i] if arg_i < len(rest) else ""
-                    if spec == "s":
-                        out += str(val)
-                    elif spec == "d":
-                        out += str(int(val)) if val else "0"
-                    elif spec == "f":
-                        out += f"{float(val):.6f}" if val else "0.000000"
-                    elif spec == "%":
-                        out += "%"
-                    elif spec == "n":
-                        out += "\n"
+            # Count how many arguments the format string consumes per pass
+            # (one per %s / %d / %f specifier, ignoring %% which consumes none)
+            specifiers_per_pass = len(re.findall(r"%[sdif]", fmt))
+            if specifiers_per_pass == 0 or not rest:
+                # No specifiers or no args – run exactly once
+                passes = [(fmt, [])]
+            else:
+                # Group rest into chunks of specifiers_per_pass
+                passes = []
+                for start in range(0, max(len(rest), 1), specifiers_per_pass):
+                    passes.append((fmt, rest[start:start + specifiers_per_pass]))
+
+            for cur_fmt, cur_args in passes:
+                out = ""
+                i = 0
+                arg_i = 0
+                while i < len(cur_fmt):
+                    if cur_fmt[i] == "%" and i + 1 < len(cur_fmt):
+                        spec = cur_fmt[i + 1]
+                        val = cur_args[arg_i] if arg_i < len(cur_args) else ""
+                        if spec == "s":
+                            out += str(val)
+                        elif spec in ("d", "i"):
+                            out += str(int(val)) if val else "0"
+                        elif spec == "f":
+                            out += f"{float(val):.6f}" if val else "0.000000"
+                        elif spec == "%":
+                            out += "%"
+                        elif spec == "n":
+                            out += "\n"
+                        else:
+                            out += "%" + spec
+                        if spec != "%":
+                            arg_i += 1
+                        i += 2
+                    elif cur_fmt[i] == "\\" and i + 1 < len(cur_fmt):
+                        esc = cur_fmt[i + 1]
+                        if esc == "n":
+                            out += "\n"
+                        elif esc == "t":
+                            out += "\t"
+                        elif esc == "\\":
+                            out += "\\"
+                        else:
+                            out += "\\" + esc
+                        i += 2
                     else:
-                        out += "%" + spec
-                    if spec != "%":
-                        arg_i += 1
-                    i += 2
-                elif fmt[i] == "\\" and i+1 < len(fmt):
-                    esc = fmt[i+1]
-                    if esc == "n": out += "\n"
-                    elif esc == "t": out += "\t"
-                    elif esc == "\\": out += "\\"
-                    else: out += "\\" + esc
-                    i += 2
-                else:
-                    out += fmt[i]
-                    i += 1
-            print(out, end="")
+                        out += cur_fmt[i]
+                        i += 1
+                print(out, end="")
         except Exception as e:
             print(f"printf: {e}")
         self.env.last_exit_code = 0
@@ -1944,16 +1960,18 @@ class Shell:
     def du(self, args):
         flags = [a for a in args if a.startswith("-")]
         targets = [a for a in args if not a.startswith("-")]
-        human = "-h" in flags
-        summary = "-s" in flags
+        human = "-h" in flags or (len(flags) > 0 and any("h" in f for f in flags))
+        summary = "-s" in flags or (len(flags) > 0 and any("s" in f for f in flags))
         path = targets[0] if targets else "."
         try:
             node = self.resolve_path(path)
         except FileNotFoundError as e:
-            print(f"du: {e}");
-            return
+            print(f"du: {e}"); return
         total = self._du_size(node)
-        size_str = self._human_size(total) if human else str(total // 1024 or 1)
+        if human:
+            size_str = self._human_size(total)
+        else:
+            size_str = str(max(1, (total + 1023) // 1024))
         print(f"{size_str}\t{path}")
 
     def _du_size(self, node):
@@ -1962,11 +1980,11 @@ class Shell:
         return sum(self._du_size(c) for c in node.children.values()) + 4096
 
     def _human_size(self, size):
-        for unit in ["B", "K", "M", "G"]:
+        for unit in ["B", "K", "M", "G", "T"]:
             if size < 1024:
                 return f"{size:.0f}{unit}"
             size /= 1024
-        return f"{size:.0f}T"
+        return f"{size:.0f}P"
 
     def df(self, args):
         human = "-h" in args
