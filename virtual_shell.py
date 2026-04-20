@@ -1,37 +1,73 @@
 """
-virtual_shell.py  –  A fully-featured virtual Linux shell for the Cyber Lab CTF.
+virtual_shell.py  –  A fully-featured virtual Linux shell.
 
-Structure
-─────────
-  Node               – one inode in the in-memory filesystem tree
-  VirtualEnvironment – filesystem tree + network topology + env vars
-  ScriptInterpreter  – Bash-like script engine (if/for/while/functions/pipes)
-  Shell              – interactive command dispatcher + all built-in commands
-  main()             – REPL with readline history, tab-completion, Ctrl+C
+This module provides an in-memory, interactive Unix-like shell experience
+designed for educational scenarios. It simulates a realistic Linux environment
+including a virtual filesystem, network topology, Bash-like scripting, and a
+full-screen text editor — all without touching the real filesystem or network.
 
-Pipe chains  (CHANGED/FIXED in latest version)
-────────────────────────────────────────────────
-  cmd1 | cmd2 | cmd3  now works correctly for any number of stages.
-  Each stage captures its stdout and feeds it to the next stage as stdin.
+Architecture Overview
+---------------------
+Node
+    One inode in the in-memory filesystem tree. Stores name, content,
+    permissions, owner, modification time, and child nodes.
 
-mtime  (CHANGED in latest version)
-────────────────────────────────────
-  Node.mtime is now a datetime.datetime object (was a static string).
-  Node.mtime_str  → formatted string for ls -l / stat output
-  Node.touch_mtime()  → update to now; called by every write operation
-    (nano save, >, >>, touch, mv, wget, curl -o, tee)
+VirtualEnvironment
+    Owns the filesystem root, current working directory, environment
+    variables, and the simulated network topology (hosts, services, flags).
 
-Nano editor  (CHANGED in latest version)
-─────────────────────────────────────────
-  Uses Python curses for a real full-screen editor with arrow-key movement.
-  Falls back to the old prompt-based line editor when curses is unavailable.
+ScriptInterpreter
+    Bash-like script engine supporting variables, arithmetic, command
+    substitution, if/elif/else, for/while/until loops, functions, pipes,
+    and I/O redirection.
 
-readline integration  (CHANGED in latest version)
-──────────────────────────────────────────────────
-  Arrow ↑/↓  navigate command history
-  Tab         autocomplete command names (first word) or paths (later words)
-  Ctrl+C      at prompt: clear line (like bash); during command: cancel
-  Ctrl+D      exit the shell
+Shell
+    Interactive command dispatcher.  Registers ~60 built-in commands
+    (ls, cat, grep, nano, ping, curl, …) and exposes them through a
+    unified Command descriptor.
+
+main()
+    Entry point: builds the environment and Shell, selects the best
+    available input backend, then runs the REPL loop.
+
+
+Input Backends (priority order)
+--------------------------------
+1. **prompt_toolkit** – works in every environment including Jupyter,
+   PyCharm, VS Code terminals, and real TTYs.  Provides full Tab
+   completion and persistent ↑/↓ command history.
+   Install once with:  pip install prompt_toolkit
+
+2. **readline** – standard Unix completion/history; active only when
+   stdin *and* stdout are real TTYs (i.e. not inside an IDE).
+
+3. **plain input()** – universal fallback; no history or completion.
+
+Nano Editor
+-----------
+* **TTY mode** – full-screen curses editor with cursor movement,
+  scrolling, cut/paste, and colour title/status bars.
+  Key bindings: Ctrl+X quit · Ctrl+S save · Ctrl+K cut · Ctrl+U paste.
+  (Ctrl+Q is also accepted but many terminals intercept it for XON/XOFF
+  flow-control; Ctrl+X is the reliable choice, matching real GNU nano.)
+
+* **Non-TTY fallback** – when stdin is not a real terminal (Jupyter,
+  PyCharm) a ``prompt_toolkit``-powered multi-line editor is used
+  instead.  It gives full up/down/left/right cursor movement, inline
+  editing of every line, and plays nicely with IDE copy/paste.
+  Commands: Ctrl+S save · Ctrl+Q quit · Ctrl+X save+quit · Ctrl+G help.
+
+Pipe Chains
+-----------
+``cmd1 | cmd2 | cmd3`` works for any number of stages.  Each stage
+captures its stdout and feeds it as stdin to the next stage.
+
+Modification Times
+------------------
+``Node.mtime`` is a ``datetime.datetime`` object updated by every write
+operation (nano save, ``>``, ``>>``, ``touch``, ``mv``, ``wget``,
+``curl -o``, ``tee``).  ``Node.mtime_str`` returns the ``ls -l``
+formatted string.
 """
 
 import shlex
@@ -40,11 +76,39 @@ import re
 import random
 import datetime
 import curses
-import readline
+import sys
+import io
+import termios
+import readline # perhaps delete
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 import io
 import sys
+
+# ---------------------------------------------------------------------------
+# Environment detection
+# ---------------------------------------------------------------------------
+
+def _is_tty() -> bool:
+    """Return True only when stdin *and* stdout are a real terminal (TTY).
+
+    This is False inside PyCharm Run console, Jupyter notebooks, and any
+    other environment that replaces sys.stdin with a non-TTY stream.
+    """
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+_IN_TTY: bool = _is_tty()
+
+_RL_AVAILABLE = False
+try:
+    import readline as _readline  # type: ignore
+    _RL_AVAILABLE = True
+except ImportError:
+    pass
 
 # =========================================================
 # FILE SYSTEM NODE
@@ -2430,23 +2494,43 @@ class Shell:
     # =====================================================
     # NANO EDITOR
     # =====================================================
+    # Strategy:
+    #   1. Try curses.wrapper() – works in any real terminal.
+    #   2. If curses raises (non-TTY / Windows), fall back to
+    #      the simple line-based editor driven by plain input().
+    #
+    # The curses editor is a proper full-screen application:
+    #   • Title bar at top, key-hint bar + status at bottom
+    #   • Arrow keys move the cursor character/line at a time
+    #   • Home/End jump to line boundaries
+    #   • PgUp/PgDn scroll one screen
+    #   • Enter inserts a new line
+    #   • Backspace / Delete remove characters
+    #   • Ctrl+S  save (stay open)
+    #   • Ctrl+X  save + quit
+    #   • Ctrl+Q  quit (warns if unsaved)
+    #   • Ctrl+K  cut current line to clipboard
+    #   • Ctrl+U  paste clipboard before current line
+    #   • Ctrl+G  show keybindings in status bar
+    # =====================================================
     def nano(self, args):
         """
-        Open a file in the interactive text editor.
+        Open a file in the interactive text editor (nano-like).
 
-        Controls (inside nano):
-          Arrow keys   – move cursor up / down / left / right
-          Home / End   – jump to start or end of line
-          PgUp / PgDn  – scroll one screen
-          Enter        – insert new line
-          Backspace    – delete character before cursor
-          Delete       – delete character under cursor
-          Ctrl+S       – save file
-          Ctrl+Q       – quit (asks to save if modified)
-          Ctrl+X       – same as Ctrl+Q
-          Ctrl+K       – cut (delete) current line, hold in clipboard
-          Ctrl+U       – paste (uncut) clipboard before current line
-          Ctrl+G       – show help bar
+        Controls
+        --------
+        Arrow keys     move cursor
+        Home / End     start / end of line
+        PgUp / PgDn    scroll one screen
+        Enter          insert new line
+        Backspace      delete character before cursor
+        Delete         delete character under cursor
+        Ctrl+S         save (editor stays open)
+        Ctrl+X         save and quit
+        Ctrl+Q         quit (asks to save if modified)
+        Ctrl+K         cut current line into clipboard
+        Ctrl+U         paste clipboard before current line
+        Ctrl+G         show keybindings in status bar
         """
         if not args:
             print("usage: nano <filename>"); return
@@ -2471,8 +2555,10 @@ class Shell:
         if not lines:
             lines = [""]  # always at least one line so the cursor has somewhere to sit
 
-        result_lines = self._nano_curses(filename, lines[:])
-
+        if _IN_TTY:
+            result_lines = self._nano_curses(filename, lines[:])
+        else:
+            result_lines = self._nano_simple(filename, lines[:])
 
         if result_lines is None:
             # User cancelled (Ctrl+Q without saving)
@@ -2481,7 +2567,7 @@ class Shell:
         content = "\n".join(result_lines)
         if name in parent.children:
             parent.children[name].content = content
-            parent.children[name].touch_mtime()  # CHANGED: update real mtime
+            parent.children[name].touch_mtime()
         else:
             parent.children[name] = Node(
                 name, parent, is_dir=False, content=content, owner=self.env.user
@@ -2490,121 +2576,149 @@ class Shell:
         self.env.last_exit_code = 0
 
     # ------------------------------------------------------------------
-    # Curses-based nano implementation
+    # CURSES EDITOR  (TTY environments/full-screen, works in any real terminal)
     # ------------------------------------------------------------------
     def _nano_curses(self, filename: str, lines: list) -> list:
+        """Full-screen curses nano editor.
+
+        Raises any curses exception so the caller can fall back to the
+        plain editor — this keeps the logic in one place.
+
+        Returns the edited lines, or None if the user cancelled.
         """
-        Full-screen curses editor.
-        Returns the edited list of lines, or None if user cancelled without saving.
-        CHANGED: completely new implementation replacing the old prompt-based editor.
-        """
-        # Shared mutable state passed into the curses wrapper
-        state = {
-            "lines": lines,
-            "cx": 0,  # cursor column  (index into line)
-            "cy": 0,  # cursor row     (index into lines)
-            "scroll": 0,  # first visible line index
-            "modified": False,
-            "saved": False,
-            "cancelled": False,
-            "clipboard": "",  # Ctrl+K clipboard
-            "msg": "",  # status-bar message
+        # ── disable XON/XOFF so Ctrl+Q reaches the application ──────────
+        # termios is Unix-only; guard so the code still runs on Windows.
+        _saved_termios = None
+        try:
+            fd = sys.stdin.fileno()
+            _saved_termios = termios.tcgetattr(fd)
+            attrs = termios.tcgetattr(fd)
+            attrs[0] &= ~termios.IXON   # c_iflag: stop terminal stealing Ctrl+Q
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        except Exception:
+            pass  # non-Unix or no controlling terminal – proceed without fix
+
+        # ── shared mutable state ─────────────────────────────────────────
+        state: dict = {
+            "lines":     lines,
+            "cx":        0,        # cursor column index into current line
+            "cy":        0,        # cursor row index into lines list
+            "scroll":    0,        # index of the first visible line
+            "modified":  False,    # True when there are unsaved changes
+            "saved":     False,    # True after at least one successful save
+            "cancelled": False,    # True if user quit without ever saving
+            "clipboard": "",       # Ctrl+K clipboard (one line)
+            "msg":       "",       # one-shot status bar message
         }
 
-        def _editor(stdscr):
-            curses.curs_set(1)
-            curses.use_default_colors()
+        # ── inner curses function ─────────────────────────────────────────
+        def _editor(stdscr) -> None:
+            """Inner curses main loop; runs inside ``curses.wrapper``."""
+            curses.curs_set(1)  # show the hardware cursor
+            curses.use_default_colors()  # allow -1 (transparent background)
+
+            # Attempt colour initialisation; degrade gracefully if unavailable.
+
             # Try to use color if available
             try:
                 curses.start_color()
                 curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)  # title bar
-                curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)  # status bar
+                curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)   # help bar
                 has_color = True
             except Exception:
                 has_color = False
 
-            def draw():
+            # ----------------------------------------------------------
+            def clamp():
+                """Keep cursor and scroll in valid range after any change."""
+                state["cy"] = max(0, min(state["cy"], len(state["lines"]) - 1))
+                state["cx"] = max(0, min(state["cx"], len(state["lines"][state["cy"]])))
+                rows, _ = stdscr.getmaxyx()
+                text_rows = max(1, rows - 3)
+                if state["cy"] < state["scroll"]:
+                    state["scroll"] = state["cy"]
+                elif state["cy"] >= state["scroll"] + text_rows:
+                    state["scroll"] = state["cy"] - text_rows + 1
+
+            # ----------------------------------------------------------
+            def draw() -> None:
+                """Redraw the entire screen from the current state."""
                 stdscr.erase()
                 rows, cols = stdscr.getmaxyx()
-                # ── title bar ──
-                title = f" nano: {filename} {'[modified]' if state['modified'] else ''}"
-                title = title[:cols - 1].ljust(cols - 1)
+                text_rows = max(1, rows - 3)
+
+                # ── title bar (row 0) ──────────────────────────────────
+                flag = " [modified]" if state["modified"] else ""
+                title = f" nano: {filename}{flag}".ljust(cols - 1)[:cols - 1]
                 try:
-                    if has_color:
-                        stdscr.addstr(0, 0, title, curses.color_pair(1))
-                    else:
-                        stdscr.addstr(0, 0, title, curses.A_REVERSE)
+                    attr = curses.color_pair(1) if has_color else curses.A_REVERSE
+                    stdscr.addstr(0, 0, title, attr)
                 except curses.error:
                     pass
 
-                # ── text area ──
-                text_rows = rows - 3  # top bar + bottom bar + help bar
-                vis_lines = state["lines"][state["scroll"]: state["scroll"] + text_rows]
-                for row_i, line in enumerate(vis_lines):
-                    display = line[:cols - 1]
+                # ── text area (rows 1 … text_rows) ────────────────────
+                for row_i in range(text_rows):
+                    line_i = state["scroll"] + row_i
+                    if line_i >= len(state["lines"]):
+                        break
+                    display = state["lines"][line_i][:cols - 1]
                     try:
                         stdscr.addstr(row_i + 1, 0, display)
                     except curses.error:
                         pass
 
-                # ── help bar ──
-                help_txt = " ^S Save  ^Q Quit  ^K Cut  ^U Paste  Arrows Move"
+                # ── help bar (second-to-last row) ─────────────────────
+                help_txt = "  ^S Save  ^X Save+Quit  ^Q Quit  ^K Cut  ^U Paste  ^G Help"
                 help_txt = help_txt[:cols - 1].ljust(cols - 1)
                 try:
-                    if has_color:
-                        stdscr.addstr(rows - 2, 0, help_txt, curses.color_pair(2))
-                    else:
-                        stdscr.addstr(rows - 2, 0, help_txt, curses.A_REVERSE)
+                    attr2 = curses.color_pair(2) if has_color else curses.A_REVERSE
+                    stdscr.addstr(rows - 2, 0, help_txt, attr2)
                 except curses.error:
                     pass
 
-                # ── status bar ──
-                line_info = f" Ln {state['cy'] + 1}/{len(state['lines'])}  Col {state['cx'] + 1}"
-                status_msg = (state["msg"] or line_info)[:cols - 1].ljust(cols - 1)
+                # ── status bar (last row) ──────────────────────────────
+                line_info = (
+                    f" Ln {state['cy'] + 1}/{len(state['lines'])} "
+                    f" Col {state['cx'] + 1}"
+                )
+                status = (state["msg"] or line_info)[:cols - 1].ljust(cols - 1)
                 try:
-                    stdscr.addstr(rows - 1, 0, status_msg[:cols - 1])
+                    stdscr.addstr(rows - 1, 0, status)
                 except curses.error:
                     pass
-                state["msg"] = ""  # clear one-shot message after displaying
+                state["msg"] = ""  # messages display for exactly one frame
 
-                # ── position cursor ──
+                # ── hardware cursor ────────────────────────────────────
                 vis_cy = state["cy"] - state["scroll"]
                 vis_cx = min(state["cx"], cols - 2)
                 try:
                     stdscr.move(vis_cy + 1, vis_cx)
                 except curses.error:
                     pass
+
                 stdscr.refresh()
 
-            def clamp():
-                """Keep cx/cy/scroll in valid range after any change."""
-                state["cy"] = max(0, min(state["cy"], len(state["lines"]) - 1))
-                max_cx = len(state["lines"][state["cy"]])
-                state["cx"] = max(0, min(state["cx"], max_cx))
-                rows, _ = stdscr.getmaxyx()
-                text_rows = rows - 3
-                if state["cy"] < state["scroll"]:
-                    state["scroll"] = state["cy"]
-                elif state["cy"] >= state["scroll"] + text_rows:
-                    state["scroll"] = state["cy"] - text_rows + 1
-
-            def save():
+            # ----------------------------------------------------------
+            def save() -> None:
+                """Mark the buffer as saved and flash a status message."""
                 state["saved"] = True
                 state["modified"] = False
                 state["msg"] = " File saved."
 
+            # ── main event loop ────────────────────────────────────────
             while True:
                 draw()
+
                 try:
                     key = stdscr.get_wch()
                 except curses.error:
                     continue
 
                 rows, cols = stdscr.getmaxyx()
-                text_rows = rows - 3
-                cur_line = state["lines"][state["cy"]]
+                text_rows  = max(1, rows - 3)
+                cur_line   = state["lines"][state["cy"]]
 
-                # ── navigation keys ──
+                # Navigation
                 if key == curses.KEY_UP:
                     if state["cy"] > 0:
                         state["cy"] -= 1
@@ -2633,45 +2747,48 @@ class Shell:
                         state["cx"] = 0
                     clamp()
 
-                elif key == curses.KEY_HOME or key == 1:  # Home or Ctrl+A
+                elif key in (curses.KEY_HOME, 1):   # Home or Ctrl+A
                     state["cx"] = 0
 
-                elif key == curses.KEY_END or key == 5:  # End or Ctrl+E
+                elif key in (curses.KEY_END, 5):    # End or Ctrl+E
                     state["cx"] = len(cur_line)
 
-                elif key == curses.KEY_PPAGE:  # Page Up
+                elif key == curses.KEY_PPAGE:       # Page Up
                     state["cy"] = max(0, state["cy"] - text_rows)
                     state["scroll"] = max(0, state["scroll"] - text_rows)
                     clamp()
 
-                elif key == curses.KEY_NPAGE:  # Page Down
+                elif key == curses.KEY_NPAGE:       # Page Down
                     state["cy"] = min(len(state["lines"]) - 1, state["cy"] + text_rows)
                     clamp()
 
-                # ── editing ──
+                # Editing: Backspace
                 elif key in (curses.KEY_BACKSPACE, 127, "\x7f"):
                     if state["cx"] > 0:
                         ln = state["lines"][state["cy"]]
                         state["lines"][state["cy"]] = ln[:state["cx"] - 1] + ln[state["cx"]:]
                         state["cx"] -= 1
+                        state["modified"] = True
                     elif state["cy"] > 0:
                         prev = state["lines"][state["cy"] - 1]
                         state["cx"] = len(prev)
                         state["lines"][state["cy"] - 1] = prev + state["lines"][state["cy"]]
                         state["lines"].pop(state["cy"])
                         state["cy"] -= 1
-                    state["modified"] = True
+                        state["modified"] = True
                     clamp()
 
+                # Editing: Delete
                 elif key == curses.KEY_DC:  # Delete key
                     ln = state["lines"][state["cy"]]
                     if state["cx"] < len(ln):
                         state["lines"][state["cy"]] = ln[:state["cx"]] + ln[state["cx"] + 1:]
+                        state["modified"] = True
                     elif state["cy"] < len(state["lines"]) - 1:
                         state["lines"][state["cy"]] += state["lines"].pop(state["cy"] + 1)
-                    state["modified"] = True
+                        state["modified"] = True
 
-                elif key in ("\n", "\r", curses.KEY_ENTER, 10, 13):  # Enter
+                elif key in ("\n", "\r", curses.KEY_ENTER, 10, 13):  # Enter / Return
                     ln = state["lines"][state["cy"]]
                     state["lines"][state["cy"]] = ln[:state["cx"]]
                     state["lines"].insert(state["cy"] + 1, ln[state["cx"]:])
@@ -2680,53 +2797,60 @@ class Shell:
                     state["modified"] = True
                     clamp()
 
-                # ── Ctrl+K: cut (delete) current line ──
-                elif key == "\x0b" or key == 11:
+                # Ctrl+K: cut current line
+                elif key in ("\x0b", 11):
                     state["clipboard"] = state["lines"].pop(state["cy"])
                     if not state["lines"]:
                         state["lines"] = [""]
                     state["cy"] = min(state["cy"], len(state["lines"]) - 1)
                     state["cx"] = min(state["cx"], len(state["lines"][state["cy"]]))
                     state["modified"] = True
-                    state["msg"] = " Line cut to clipboard (Ctrl+U to paste)."
+                    state["msg"] = "  Line cut. Press ^U to paste."
                     clamp()
 
-                # ── Ctrl+U: paste clipboard ──
-                elif key == "\x15" or key == 21:
+                # Ctrl+U: paste clipboard
+                elif key in ("\x15", 21):
                     if state["clipboard"]:
                         state["lines"].insert(state["cy"], state["clipboard"])
                         state["modified"] = True
-                        state["msg"] = " Pasted from clipboard."
+                        state["msg"] = "  Pasted."
                     clamp()
 
-                # ── Ctrl+S: save ──
+                # Ctrl+S: save in place
                 elif key in ("\x13", 19):
                     save()
 
-                # ── Ctrl+Q or Ctrl+X: quit ──
-                elif key in ("\x11", 17, "\x18", 24):
+                # Ctrl+X: save and quit
+                elif key in ("\x18", 24):
+                    state["saved"] = True
+                    break
+
+                # Ctrl+Q: quit (warn if unsaved)
+                elif key in ("\x11", 17):
                     if state["modified"] and not state["saved"]:
-                        # Ask to save
-                        rows, cols = stdscr.getmaxyx()
-                        prompt = " Save before quitting? (y/n): "
+                        # Show prompt in status bar
+                        rows2, cols2 = stdscr.getmaxyx()
+                        prompt = " Unsaved changes. Save? (y/n): "
                         try:
-                            stdscr.addstr(rows - 1, 0, prompt.ljust(cols - 1))
+                            stdscr.addstr(rows2 - 1, 0, prompt.ljust(cols2 - 1))
                             stdscr.refresh()
                             curses.echo()
-                            ans_raw = stdscr.getstr(rows - 1, len(prompt), 3)
+                            raw = stdscr.getstr(rows2 - 1, len(prompt), 3)
                             curses.noecho()
-                            ans = ans_raw.decode("utf-8", errors="ignore").strip().lower()
+                            ans = raw.decode("utf-8", errors="ignore").strip().lower()
                         except Exception:
                             ans = "n"
                         if ans in ("y", "yes"):
-                            save()
+                            state["saved"] = True
+                        else:
+                            state["cancelled"] = True
                     break
 
-                # ── Ctrl+G: help overlay ──
+                # Ctrl+G: show help
                 elif key in ("\x07", 7):
-                    state["msg"] = " ^S=Save ^Q=Quit ^K=CutLine ^U=Paste Arrows=Move"
+                    state["msg"] = "  ^S Save  ^X Save+Quit  ^Q Quit  ^K Cut line  ^U Paste  Arrows Move"
 
-                # ── regular character ──
+                # ── Printable character ────────────────────────────────
                 elif isinstance(key, str) and key.isprintable():
                     ln = state["lines"][state["cy"]]
                     state["lines"][state["cy"]] = ln[:state["cx"]] + key + ln[state["cx"]:]
@@ -2739,13 +2863,133 @@ class Shell:
                     state["cx"] += 1
                     state["modified"] = True
 
-        curses.wrapper(_editor)
+        # ── run inside wrapper (handles init/cleanup) ─────────────────────
+        try:
+            curses.wrapper(_editor)
+        finally:
+            # Restore terminal settings
+            if _saved_termios is not None:
+                try:
+                    import termios
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, _saved_termios)
+                except Exception:
+                    pass
 
         if state["cancelled"]:
             return None
-        # If user quit without ever saving: still return lines (caller will save)
-        # If user explicitly saved at least once OR just quit: return lines
         return state["lines"]
+
+    # Todo: continue code compare here
+
+    # ------------------------------------------------------------------
+    # PLAIN LINE EDITOR  (fallback when curses is unavailable)
+    # ------------------------------------------------------------------
+    def _nano_simple(self, filename: str, lines: list) -> list:
+        """Simple prompt-based editor used when curses is not available.
+
+        Commands
+        --------
+        :wq           save and quit
+        :q!           quit without saving (discard changes)
+        :s  or  :list show the current buffer with line numbers
+        :a            enter append mode (type lines; :done to finish)
+        :d N          delete line number N
+        :i N <text>   insert <text> before line N
+        N: <text>     replace line N with <text>
+        <anything>    append as a new line
+        """
+        ext = filename.rsplit(".", 1)[-1] if "." in filename else ""
+        ftype = {"py": "Python", "sh": "Shell", "txt": "Text", "md": "Markdown",
+                 "json": "JSON", "js": "JavaScript", "html": "HTML", "css": "CSS"}.get(ext, "File")
+
+        print(f"\n  nano (text mode) — {ftype}: {filename}")
+        print("  " + "─" * 53)
+        print("  :wq save & quit  |  :q! cancel  |  :s show buffer")
+        print("  N: <text>  replace line N  |  :d N  delete line N")
+        print("  :a  append mode  |  :i N <text>  insert before N")
+        print("  " + "─" * 53 + "\n")
+
+        def show_buf():
+            if not lines:
+                print("  (empty)")
+            else:
+                for i, ln in enumerate(lines, 1):
+                    print(f"  {i:3} | {ln}")
+            print()
+
+        show_buf()
+
+        while True:
+            try:
+                raw = input("  nano> ")
+            except EOFError:
+                break
+            s = raw.strip()
+
+            if s == ":wq":
+                return lines
+            if s == ":q!":
+                return None
+            if s in (":s", ":show", ":l", ":list"):
+                show_buf()
+                continue
+
+            # :d N — delete line
+            m = re.fullmatch(r":d\s+(\d+)", s)
+            if m:
+                idx = int(m.group(1)) - 1
+                if 0 <= idx < len(lines):
+                    print(f"  deleted: {lines.pop(idx)}")
+                else:
+                    print(f"  error: no line {idx + 1}")
+                show_buf()
+                continue
+
+            # :i N <text> — insert before line N
+            m = re.fullmatch(r":i\s+(\d+)\s+(.*)", s, re.DOTALL)
+            if m:
+                idx = int(m.group(1)) - 1
+                lines.insert(max(0, idx), m.group(2))
+                print(f"  inserted before line {idx + 1}")
+                show_buf()
+                continue
+
+            # :a — append mode
+            if s == ":a":
+                print("  append mode – type lines, enter :done to finish\n")
+                while True:
+                    try:
+                        ln = input("  + ")
+                    except EOFError:
+                        break
+                    if ln.strip() == ":done":
+                        break
+                    lines.append(ln)
+                show_buf()
+                continue
+
+            # N: <text> — replace line N
+            m = re.fullmatch(r"(\d+):\s*(.*)", s, re.DOTALL)
+            if m:
+                idx = int(m.group(1)) - 1
+                text = m.group(2)
+                if 0 <= idx < len(lines):
+                    lines[idx] = text
+                    print(f"  updated line {idx + 1}")
+                elif idx == len(lines):
+                    lines.append(text)
+                    print(f"  appended line {idx + 1}")
+                else:
+                    print(f"  error: line {idx + 1} out of range")
+                show_buf()
+                continue
+
+            # Plain text → append as new line
+            if raw:
+                lines.append(raw)
+                print(f"  appended line {len(lines)}")
+
+        return lines
 
 
     # =====================================================
@@ -3679,12 +3923,90 @@ class Shell:
             print(f"No manual entry for {cmd_name}")
             self.env.last_exit_code = 1
 
-# =========================================================
-# MAIN LOOP
-# =========================================================
-def main():
+
+# ===========================================================================
+# TAB-COMPLETION  (used by both the prompt_toolkit and readline backends)
+# ===========================================================================
+
+class ShellCompleter:
+    """Context-aware tab-completer for readline.
+
+    First token  → complete against command names + aliases.
+    Later tokens → complete against virtual filesystem paths.
+
+    Used by readline's set_completer() in main().
+    CHANGED: no longer inherits from prompt_toolkit – pure readline.
+    """
+
+    def __init__(self, shell: "Shell", env: "VirtualEnvironment") -> None:
+        self._shell = shell
+        self._env   = env
+        self._cache: list = []
+
+    def readline_match(self, text: str, state: int) -> Optional[str]:
+        """readline callback: return state-th match for text, or None."""
+        if state == 0:
+            try:
+                buf = _readline.get_line_buffer()
+            except Exception:
+                buf = text
+            self._cache = self._candidates(buf, text)
+        try:
+            return self._cache[state]
+        except IndexError:
+            return None
+
+    def _candidates(self, line_so_far: str, word: str) -> list:
+        tokens = line_so_far.lstrip().split()
+        completing_cmd = (
+            not tokens or
+            (len(tokens) == 1 and not line_so_far.endswith(" "))
+        )
+        if completing_cmd:
+            names = sorted(
+                list(self._shell.commands.keys()) +
+                list(self._shell._aliases.keys())
+            )
+            return [c for c in names if c.startswith(word)]
+        # Path completion
+        try:
+            if "/" in word:
+                dir_part, file_part = word.rsplit("/", 1)
+                base   = self._shell.resolve_path(dir_part or "/")
+                prefix = dir_part + "/"
+            else:
+                base      = self._env.cwd
+                file_part = word
+                prefix    = ""
+            if not base.is_dir:
+                return []
+            return sorted(
+                prefix + name + ("/" if node.is_dir else "")
+                for name, node in base.children.items()
+                if name.startswith(file_part)
+            )
+        except Exception:
+            return []
+
+
+# ===========================================================================
+# MAIN  –  entry point
+# ===========================================================================
+
+def main() -> None:
+    """Build the virtual environment and run the interactive REPL.
+
+    Input backend:
+    1. readline (if available)  – arrow-key history + tab-completion.
+    2. plain input()            – universal fallback.
+
+    Ctrl+C at prompt: clear line (like real bash), don't exit.
+    Ctrl+C during command: cancel command, return to prompt.
+    Ctrl+D: exit.
+    """
     env   = VirtualEnvironment()
     shell = Shell(env)
+    completer = ShellCompleter(shell, env)
 
     print("╔══════════════════════════════════════════════════╗")
     print("║         Cyber Shell Lab  –  Virtual Terminal     ║")
@@ -3694,81 +4016,30 @@ def main():
     print("║  Arrow ↑/↓  history  |  Tab  autocomplete        ║")
     print("╚══════════════════════════════════════════════════╝\n")
 
-    # ── readline: arrow-key history + tab completion ─────────────────
-    # CHANGED: was inside a try/except with a broken duplicate KeyboardInterrupt
-    # handler. Now cleanly configured before the loop.
-    try:
-
-        def _tab_completer(text, state):
-            """
-            Complete command names for the first token,
-            and filesystem paths for subsequent tokens.
-            CHANGED: context-aware: first word → commands, later words → files.
-            """
-            buf    = readline.get_line_buffer()
-            tokens = buf.lstrip().split()
-
-            # Decide what we are completing
-            if not tokens or (len(tokens) == 1 and not buf.endswith(" ")):
-                # Completing the command name
-                candidates = (
-                    list(shell.commands.keys()) +
-                    list(shell._aliases.keys())
-                )
-                matches = sorted(c for c in candidates if c.startswith(text))
-            else:
-                # Completing a filesystem path argument
-                try:
-                    if "/" in text:
-                        dir_part, file_part = text.rsplit("/", 1)
-                        base = shell.resolve_path(dir_part or "/")
-                        prefix = dir_part + "/"
-                    else:
-                        base       = env.cwd
-                        file_part  = text
-                        prefix     = ""
-
-                    if not base.is_dir:
-                        matches = []
-                    else:
-                        matches = sorted(
-                            prefix + nm + ("/" if nd.is_dir else "")
-                            for nm, nd in base.children.items()
-                            if nm.startswith(file_part)
-                        )
-                except Exception:
-                    matches = []
-
-            try:
-                return matches[state]
-            except IndexError:
-                return None
-
-        readline.set_completer(_tab_completer)
-        # On macOS readline is actually libedit; the bind syntax differs
-        if "libedit" in readline.__doc__ if readline.__doc__ else "":
-            readline.parse_and_bind("bind ^I rl_complete")
+    # ── Set up readline if available ──────────────────────────────────────
+    if _RL_AVAILABLE:
+        _readline.set_completer(completer.readline_match)
+        # macOS ships libedit instead of GNU readline; bind syntax differs
+        doc = getattr(_readline, "__doc__", "") or ""
+        if "libedit" in doc:
+            _readline.parse_and_bind("bind ^I rl_complete")
         else:
-            readline.parse_and_bind("tab: complete")
-        readline.set_completer_delims(" \t\n;|&")
-        # Arrow-key history navigation is automatic once readline is imported
-        _rl = True
-    except ImportError:
-        _rl = False
+            _readline.parse_and_bind("tab: complete")
+        _readline.set_completer_delims(" \t\n;|&")
+        # Arrow ↑/↓ history navigation is automatic once readline is active
 
-    # ── main REPL loop ────────────────────────────────────────────────
+    # ── REPL loop ─────────────────────────────────────────────────────────
     while True:
         try:
-            path   = shell.get_path(env.cwd)
-            prompt = f"{env.user}@{env.hostname}:{path}$ "
-            line   = input(prompt)
+            path       = shell.get_path(env.cwd)
+            prompt_str = f"{env.user}@{env.hostname}:{path}$ "
+            line       = input(prompt_str)
         except EOFError:
-            # Ctrl+D – exit cleanly
+            # Ctrl+D: exit cleanly
             print("\nlogout")
             break
         except KeyboardInterrupt:
-            # CHANGED: Ctrl+C at the prompt prints a blank line (like bash)
-            # but does NOT exit the shell.
+            # Ctrl+C at the prompt: clear line, don't exit (like real bash)
             print()
             env.last_exit_code = 130
             continue
@@ -3780,8 +4051,7 @@ def main():
         try:
             shell.run(line)
         except KeyboardInterrupt:
-            # CHANGED: Ctrl+C while a command is running cancels it (prints ^C)
-            # and returns to the prompt, matching real bash behaviour.
+            # Ctrl+C during a running command: cancel it, return to prompt
             print("^C")
             env.last_exit_code = 130
         except SystemExit as e:
