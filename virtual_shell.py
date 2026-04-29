@@ -84,6 +84,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 import io
 import sys
+from env import Node, VirtualEnvironment
 
 # ---------------------------------------------------------------------------
 # Environment detection
@@ -110,10 +111,7 @@ try:
 except ImportError:
     pass
 
-# =========================================================
-# FILE SYSTEM NODE
-# =========================================================
-class Node:
+# Node and VirtualEnvironment moved to env.py
     def __init__(self, name, parent=None, is_dir=True, content=None, permissions=None, owner="student"):
         self.name = name
         self.parent = parent
@@ -400,6 +398,10 @@ class VirtualEnvironment:
 
         # assign generated network
         self.network = network
+
+from env import Node as _Node, VirtualEnvironment as _VirtualEnvironment
+Node = _Node
+VirtualEnvironment = _VirtualEnvironment
 
 # =========================================================
 # COMMAND DESCRIPTOR
