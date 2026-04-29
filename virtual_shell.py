@@ -159,7 +159,7 @@ class Node:
 # VIRTUAL ENVIRONMENT
 # =========================================================
 class VirtualEnvironment:
-    def __init__(self):
+    def __init__(self, codename: str = "", num_public: int = 5, num_private: int = 3):
         self.root = Node("/", permissions="rwxr-xr-x")
         self.cwd = self.root
         self.vars = {
@@ -307,7 +307,99 @@ class VirtualEnvironment:
             },
         }
 
+        # generate network from parameters
+        self.generate_random_network(codename, num_public, num_private)
+
         self.authenticated = set()
+
+    def generate_random_network(self, codename: str, num_public: int = 5, num_private: int = 3) -> None:
+        """Generate a randomized network.
+
+        Parameters:
+        - codename: string to embed in one public host's readme.
+        - num_public: number of public (no-password) hosts to create.
+        - num_private: number of private (password-protected) hosts to create.
+
+        This replaces self.network with newly generated hosts. One public host
+        will contain the codename in its home readme; other public hosts will
+        contain a default 'wrong server' message. Private hosts get randomized
+        passwords and a random auth_user.
+        """
+        import random as _random
+        import string as _string
+
+        # Ensure there's at least one public host to place the codename
+        if num_public <= 0:
+            num_public = 1
+        total = max(1, num_public + max(0, num_private))
+
+        # Reserve unique last-octets for IPs
+        octets = _random.sample(range(1, 255), total)
+
+        services_choices = [
+            {22: "ssh"},
+            {80: "http"},
+            {22: "ssh", 80: "http"},
+            {22: "ssh", 3389: "rdp"},
+            {21: "ftp", 22: "ssh"},
+        ]
+        os_choices = [
+            "Ubuntu 22.04 LTS",
+            "Debian 11",
+            "RouterOS 6.49",
+            "Windows Server 2019",
+            "Alpine Linux 3.18",
+        ]
+
+        network: dict = {}
+
+        # pick which public IP will contain the codename
+        public_octets = octets[:num_public]
+        codename_octet = _random.choice(public_octets) if codename else None
+
+        for octet in public_octets:
+            ip = f"192.168.0.{octet}"
+            name = f"host-{octet}"
+            os_choice = _random.choice(os_choices)
+            banner = f"{os_choice}"
+            home_message = (
+                f"Codename: {codename}" if octet == codename_octet
+                else "This is not the correct server. Try another host."
+            )
+            network[ip] = {
+                "name": name,
+                "public": True,
+                "services": _random.choice(services_choices),
+                "os": os_choice,
+                "latency": round(_random.uniform(0.5, 20.0), 1),
+                "banner": banner,
+                "shell_hint": "Check the home directory for clues.",
+                "home_message": home_message,
+            }
+
+        # private hosts
+        for octet in octets[num_public:]:
+            ip = f"192.168.0.{octet}"
+            name = f"priv-{octet}"
+            passwd = "".join(_random.choice(_string.ascii_letters + _string.digits) for _ in range(8))
+            auth_user = _random.choice(["admin", "root", "dbadmin", "administrator", "user"])
+            os_choice = _random.choice(os_choices)
+            banner = f"{os_choice}"
+            network[ip] = {
+                "name": name,
+                "public": False,
+                "password": passwd,
+                "auth_user": auth_user,
+                "services": _random.choice(services_choices),
+                "os": os_choice,
+                "latency": round(_random.uniform(0.5, 50.0), 1),
+                "banner": banner,
+                "shell_hint": "Authentication required.",
+                "home_message": "This is not the correct server. Try another host.",
+            }
+
+        # assign generated network
+        self.network = network
 
 # =========================================================
 # COMMAND DESCRIPTOR
@@ -3099,6 +3191,13 @@ class Shell:
         print(f"Nmap done: 254 IP addresses ({total} host{'s' if total != 1 else ''} up) scanned")
 
     def connect(self, args):
+        """Establish a simulated SSH connection and open a nested shell on success.
+
+        On successful authentication (or for public hosts) this creates a new
+        VirtualEnvironment representing the remote host (with its own files,
+        hostname and user) and launches a nested interactive Shell. Exiting that
+        nested shell returns to the original environment.
+        """
         if not args:
             print("usage: connect <ip>"); return
 
@@ -3111,6 +3210,8 @@ class Shell:
 
         host = self.env.network[ip]
         name = host["name"]
+        auth_user = host.get("auth_user", "admin")
+        correct_pw = host.get("password")  # None = honeypot
 
         # always show SSH handshake negotiation header
         print(f"SSH client version: OpenSSH_9.6p1")
@@ -3120,57 +3221,157 @@ class Shell:
         print(f"Server SSH version: SSH-2.0-OpenSSH_8.9p1")
         time.sleep(0.05)
 
-        # ---- Case 1: public host – no auth needed ----
+        # ---- Authentication ----
+        authenticated = False
+
+        # Public host: no auth required
         if host.get("public", True):
             print(f"Authenticated (publickey).\n")
             self._show_banner(ip, host)
-            return
+            authenticated = True
 
-        # ---- Case 2+3: auth required ----
-        # if already authenticated this session, skip prompt
-        if ip in self.env.authenticated:
+        # Cached session
+        elif ip in self.env.authenticated:
             print(f"Authenticated (cached session).\n")
             self._show_banner(ip, host)
-            return
+            authenticated = True
 
-        auth_user = host.get("auth_user", "admin")
-        correct_pw = host.get("password")  # None = honeypot
+        else:
+            print(f"Authentication required.")
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    entered = input(f"{auth_user}@{ip}'s password: ")
+                except EOFError:
+                    entered = ""
 
-        print(f"Authentication required.")
+                # honeypot – always deny regardless of input
+                if correct_pw is None:
+                    time.sleep(0.3)
+                    print(f"Permission denied, please try again.")
+                    if attempt == max_attempts:
+                        print(f"{auth_user}@{ip}: Permission denied (publickey,password).")
+                        print(f"ssh: connect to host {ip}: Too many authentication failures")
+                    continue
 
-        # allow up to 3 password attempts (mirrors real SSH)
-        # TODO: change perhaps password amount
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            try:
-                entered = input(f"{auth_user}@{ip}'s password: ")
-            except EOFError:
-                entered = ""
+                if entered == correct_pw:
+                    time.sleep(0.1)
+                    print(f"Authenticated.\n")
+                    self.env.authenticated.add(ip)
+                    self._show_banner(ip, host)
+                    authenticated = True
+                    break
 
-            # honeypot – always deny regardless of input
-            if correct_pw is None:
-                time.sleep(0.3)
+                time.sleep(0.2)
                 print(f"Permission denied, please try again.")
-                if attempt == max_attempts:
-                    print(f"{auth_user}@{ip}: Permission denied (publickey,password).")
-                    print(f"ssh: connect to host {ip}: Too many authentication failures")
-                continue
 
-            # correct password → grant access
-            if entered == correct_pw:
-                time.sleep(0.1)
-                print(f"Authenticated.\n")
-                self.env.authenticated.add(ip)  # CHANGED: cache session
-                self._show_banner(ip, host)
+            if not authenticated:
+                # exhausted attempts
+                print(f"\n{auth_user}@{ip}: Permission denied (publickey,password).")
+                print(f"ssh: connect to host {ip}: Too many authentication failures")
                 return
 
-            # wrong password – realistic SSH rejection message
-            time.sleep(0.2)  # brief pause mimics server response time
-            print(f"Permission denied, please try again.")
+        # ---- Spawn nested environment/shell on successful auth ----
+        if authenticated:
+            # Build a fresh VirtualEnvironment for the remote host
+            new_env = VirtualEnvironment()
+            # allow network operations from the remote host too
+            new_env.network = self.env.network
+            new_env.hostname = name
+            new_env.user = auth_user
+            new_env.vars["HOME"] = f"/home/{auth_user}"
 
-        # CHANGED: exhausted all attempts
-        print(f"\n{auth_user}@{ip}: Permission denied (publickey,password).")
-        print(f"ssh: connect to host {ip}: Too many authentication failures")
+            # Replace the home directory contents so each host has its own minimal fs
+            home_node = new_env.root.children.get("home")
+            if home_node is not None:
+                # clear any default home contents
+                home_node.children = {}
+                # Special-case Windows-style administrator: place a single readme in /home
+                if auth_user and auth_user.lower() == "administrator":
+                    default_msg = host.get("home_message", "This is not the correct server. Try another host.")
+                    home_node.children["readme.txt"] = Node("readme.txt", home_node, False, default_msg, owner=auth_user)
+                    usr_node = None
+                else:
+                    # create the connected user's home directory
+                    usr_node = Node(auth_user, home_node, True)
+                    usr_node.children = {}
+                    home_node.children[auth_user] = usr_node
+            else:
+                usr_node = None
+
+            # Default home message for decoy servers
+            default_msg = host.get("home_message", "This is not the correct server. Try another host.")
+            if usr_node is not None:
+                # add a single readme.txt by default
+                usr_node.children["readme.txt"] = Node("readme.txt", usr_node, False, default_msg, owner=auth_user)
+
+            # If the host contains a flag, place it in /root/.flag and add a real file in the user's home
+            if "flag" in host:
+                # create /root if missing
+                if "root" not in new_env.root.children:
+                    root_node = Node("root", new_env.root, True)
+                    root_node.children = {}
+                    new_env.root.children["root"] = root_node
+                else:
+                    root_node = new_env.root.children["root"]
+                root_node.children[".flag"] = Node(".flag", root_node, False, host["flag"], owner="root")
+                if usr_node is not None:
+                    # overwrite readme with a real flag file
+                    usr_node.children["flag.txt"] = Node("flag.txt", usr_node, False, host["flag"], owner=auth_user)
+
+            # Launch a nested interactive shell connected to the remote env
+            new_shell = Shell(new_env)
+            new_completer = ShellCompleter(new_shell, new_env)
+
+            old_completer = None
+            if _RL_AVAILABLE:
+                try:
+                    old_completer = _readline.get_completer()
+                except Exception:
+                    old_completer = None
+                try:
+                    _readline.set_completer(new_completer.readline_match)
+                except Exception:
+                    pass
+
+            print(f"\n--- Connected to {name} ({ip}). Type 'exit' or Ctrl+D to return ---\n")
+
+            # Nested REPL loop (returns on SystemExit or logout)
+            while True:
+                try:
+                    path = new_shell.get_path(new_env.cwd)
+                    prompt_str = f"{new_env.user}@{new_env.hostname}:{path}$ "
+                    line = input(prompt_str)
+                except EOFError:
+                    print("\nlogout")
+                    break
+                except KeyboardInterrupt:
+                    print()
+                    new_env.last_exit_code = 130
+                    continue
+
+                if line.strip() in ("exit", "logout"):
+                    print("logout")
+                    break
+
+                try:
+                    new_shell.run(line)
+                except KeyboardInterrupt:
+                    print("^C")
+                    new_env.last_exit_code = 130
+                except SystemExit as e:
+                    print(f"logout (exit code {e.code})")
+                    break
+
+            # restore previous readline completer
+            if _RL_AVAILABLE:
+                try:
+                    _readline.set_completer(old_completer)
+                except Exception:
+                    pass
+
+            # returning to the original shell
+            return
 
     def _show_banner(self, ip: str, host: dict):
         """Print the host banner, flag, and shell hint after successful login."""
