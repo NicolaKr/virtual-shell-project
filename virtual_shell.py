@@ -3142,10 +3142,19 @@ class Shell:
         print(f"rtt min/avg/max/mdev = {min(rtts)}/{avg}/{max(rtts)}/{mdev} ms")
 
     def scan(self, args):
-        prefix = args[0] if args else ""
+        # Support optional flags: -A / --auth to reveal authentication methods
+        show_auth = False
+        prefix = ""
+        for a in args:
+            if a in ("-A", "--auth"):
+                show_auth = True
+            elif a.startswith("-"):
+                # ignore other flags for now
+                continue
+            elif not prefix:
+                prefix = a
 
         # nmap-style header
-        # TODO: change print statement
         print(f"Starting scan of 192.168.0.0/24")
         print(f"Host discovery enabled. Scan report:\n")
         time.sleep(0.15)  # slight pause for realism
@@ -3180,11 +3189,27 @@ class Shell:
             if info.get("os"):
                 print(f"OS: {info['os']}")
 
-            # hint about auth requirement
+            # authentication information (always reported)
             if not info.get("public", True):
-                print(f"Note: Authentication required to connect.")
+                pw = info.get("password", "<unknown>")
+                if pw is None:
+                    auth_descr = "rejects authentication (honeypot)"
+                else:
+                    auth_descr = "password required"
+                    user = info.get("auth_user")
+                    if user:
+                        auth_descr += f" (user: {user})"
             else:
-                print(f"Note: Open access – no authentication required.")
+                auth_descr = "open (no password required)"
+            print(f"Auth: {auth_descr}")
+
+            # show banner excerpt if available
+            if info.get("banner"):
+                banner = info.get("banner", "")
+                if banner:
+                    print("Banner:")
+                    for line in banner.splitlines():
+                        print(f"  {line}")
 
             print()  # blank line between hosts
 
