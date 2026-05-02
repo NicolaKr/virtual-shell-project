@@ -10,9 +10,9 @@ from shell import Shell, ShellCompleter
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--codename", default="", help="codename to place on one public host")
-    p.add_argument("--public", type=int, default=5, help="number of public hosts to generate")
-    p.add_argument("--private", type=int, default=3, help="number of private hosts to generate")
+    p.add_argument("--codename", default="enigma", help="codename to place on one public host")
+    p.add_argument("--public", type=int, default=3, help="number of public hosts to generate")
+    p.add_argument("--private", type=int, default=1, help="number of private hosts to generate")
     args = p.parse_args()
 
     env = VirtualEnvironment(args.codename, args.public, args.private)
