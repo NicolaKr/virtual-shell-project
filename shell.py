@@ -52,6 +52,52 @@ except ImportError:
     pass
 
 
+def _brace_range(lo: int, hi: int) -> range:
+    """Return a range suitable for {lo..hi} brace expansion."""
+    if hi >= lo:
+        return range(lo, hi + 1)
+    return range(lo, hi - 1, -1)
+
+
+def _semicolon_split(line: str) -> list:
+    """Split a one-liner like 'for i in a b; do echo $i; done' into
+    logical lines the ScriptInterpreter can process, while keeping the
+    body of compound commands intact.
+
+    Strategy: split on ';' but keep the tokens 'do', 'done', 'then',
+    'fi', 'elif', 'else' on their own lines so the interpreter's
+    line-by-line parser works correctly.
+    """
+    # Simple case: no semicolons
+    if ";" not in line:
+        return [line]
+
+    parts = []
+    depth = 0  # track ( )
+    current = ""
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "(" :
+            depth += 1
+            current += ch
+        elif ch == ")":
+            depth -= 1
+            current += ch
+        elif ch == ";" and depth == 0:
+            token = current.strip()
+            if token:
+                parts.append(token)
+            current = ""
+        else:
+            current += ch
+        i += 1
+    if current.strip():
+        parts.append(current.strip())
+
+    return parts
+
+
 # ---------------------------------------------------------------------------
 # Command descriptor
 # ---------------------------------------------------------------------------
@@ -119,6 +165,7 @@ class Shell:
             Command("read",      "read <var>",                  "read input into variable",         self.read),
             Command("sleep",     "sleep <seconds>",             "sleep for N seconds",              self.sleep_cmd),
             Command("true",      "true",                        "exit with success",                self.true_cmd),
+            Command("wait",      "wait",                        "wait for background jobs (no-op)",  self.wait_cmd),
             Command("false",     "false",                       "exit with failure",                self.false_cmd),
             Command("test",      "test <expr>",                 "evaluate expression",              self.test_cmd),
             Command("env",       "env",                         "print all environment variables",  self.env_cmd),
@@ -177,6 +224,30 @@ class Shell:
         first_word = line.split()[0]
         if first_word in self._aliases:
             line = self._aliases[first_word] + line[len(first_word):]
+
+        # ── Compound / scripting constructs ──────────────────────────────
+        # for / while / until / if typed at the prompt are routed to
+        # ScriptInterpreter.  Pass the raw line as a single element;
+        # the interpreter's _expand_one_liners pre-pass will split it.
+        _kw_re = re.compile(r"^(for|while|until|if)\b")
+        if _kw_re.match(line.lstrip()):
+            ScriptInterpreter(self).run_lines([line])
+            return None
+
+        # Strip trailing background operator & (simulate synchronously)
+        if line.endswith(" &") or line.rstrip().endswith("&"):
+            line = line.rstrip().rstrip("&").rstrip()
+
+        # Unwrap bare subshell  ( cmd [&& cmd ...] )  →  inner text
+        m_sub = re.match(r"^\(\s*(.+?)\s*\)\s*$", line)
+        if m_sub:
+            line = m_sub.group(1).strip()
+
+        # Suppress /dev/null redirections at shell level
+        line = re.sub(r"\s+>\s*/dev/null", "", line)
+        line = re.sub(r"\s+2>/dev/null",   "", line)
+        line = re.sub(r"\s+&>/dev/null",   "", line)
+        line = re.sub(r"\s+>/dev/null\s+2>&1", "", line)
 
         # Pipe:  a | b | c
         if "|" in line and "||" not in line:
@@ -455,6 +526,12 @@ class Shell:
     # =========================================================
 
     def _expand_vars(self, text: str) -> str:
+        # Brace expansion  {N..M}  →  space-separated list
+        text = re.sub(
+            r"\{(\d+)\.\.(\d+)\}",
+            lambda m: " ".join(str(x) for x in _brace_range(int(m.group(1)), int(m.group(2)))),
+            text,
+        )
         text = re.sub(r"\$\?", str(self.env.last_exit_code), text)
         text = re.sub(
             r"\$\{(\w+):-([^}]*)\}",
@@ -1336,6 +1413,10 @@ class Shell:
 
     def false_cmd(self, args: list) -> None:
         self.env.last_exit_code = 1
+
+    def wait_cmd(self, args: list) -> None:
+        """No-op: in a synchronous simulator there are no background jobs."""
+        self.env.last_exit_code = 0
 
     def test_cmd(self, args: list) -> None:
         si = ScriptInterpreter(self)

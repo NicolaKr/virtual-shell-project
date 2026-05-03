@@ -41,6 +41,11 @@ class ScriptInterpreter:
         if extra_vars:
             self._local_vars.update(extra_vars)
 
+        # Pre-pass: expand one-liner compound commands into multi-line form.
+        # e.g. "for i in a b; do echo $i; done"
+        #   -> ["for i in a b", "do", "echo $i", "done"]
+        lines = self._expand_one_liners(lines)
+
         # first pass: collect function definitions
         lines = self._extract_functions(lines)
 
@@ -91,6 +96,94 @@ class ScriptInterpreter:
     # ------------------------------------------------------------------
     # control structure parsers
     # ------------------------------------------------------------------
+    def _expand_one_liners(self, lines: list[str]) -> list[str]:
+        """Expand semicolon-separated one-liners into separate lines.
+
+        "for i in a b; do echo $i; done"
+          → ["for i in a b", "do", "  echo $i", "done"]
+
+        Plain semicolons outside compound commands are also split:
+          "cd /tmp; ls"  → ["cd /tmp", "ls"]
+        """
+        result = []
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                result.append(raw)
+                continue
+
+            is_compound = re.match(r'^(for|while|until|if)', line)
+
+            if ";" not in line or not is_compound:
+                # Not a compound one-liner – split on plain semicolons
+                if ";" in line and not is_compound:
+                    for part in line.split(";"):
+                        p = part.strip()
+                        if p:
+                            result.append(p)
+                else:
+                    result.append(raw)
+                continue
+
+            # Compound one-liner: tokenise on ";" respecting nested ()
+            tokens = self._split_on_semicolons(line)
+            result.extend(tokens)
+
+        return result
+
+    def _split_on_semicolons(self, line: str) -> list:
+        """Split a compound one-liner on semicolons, keeping keywords as
+        their own tokens, and returning the whole thing as a list of lines."""
+        parts = []
+        depth = 0
+        cur = ""
+        for ch in line:
+            if ch == "(":
+                depth += 1
+                cur += ch
+            elif ch == ")":
+                depth -= 1
+                cur += ch
+            elif ch == ";" and depth == 0:
+                tok = cur.strip()
+                if tok:
+                    parts.append(tok)
+                cur = ""
+            else:
+                cur += ch
+        if cur.strip():
+            parts.append(cur.strip())
+
+        # Now reassemble: keywords "do"/"then" go on their own line;
+        # body lines are kept as separate lines; "done"/"fi" close.
+        expanded = []
+        for part in parts:
+            # "do cmd" → "do" + "  cmd" (if body mixed in)
+            m_do = re.match(r'^do\s+(.+)$', part)
+            if m_do:
+                expanded.append("do")
+                # body may itself contain semicolons
+                for bp in m_do.group(1).split(";"):
+                    bp = bp.strip()
+                    if bp and bp != "done":
+                        expanded.append("  " + bp)
+                    elif bp == "done":
+                        expanded.append("done")
+                continue
+            m_then = re.match(r'^then\s+(.+)$', part)
+            if m_then:
+                expanded.append("then")
+                for bp in m_then.group(1).split(";"):
+                    bp = bp.strip()
+                    if bp and bp not in ("fi","else"):
+                        expanded.append("  " + bp)
+                    elif bp in ("fi","else"):
+                        expanded.append(bp)
+                continue
+            expanded.append(part)
+
+        return expanded
+
     def _extract_functions(self, lines: list[str]) -> list[str]:
         out = []
         i = 0
@@ -204,7 +297,17 @@ class ScriptInterpreter:
                 if depth == 0:
                     break
             end += 1
-        body = lines[idx + 1:end]
+        raw_body = lines[idx + 1:end]
+        # Strip bare "do" delimiter lines and "do " prefix (from one-liner expansion)
+        body = []
+        for bl in raw_body:
+            bs = bl.strip()
+            if bs == "do":
+                continue
+            if bs.startswith("do "):
+                body.append(bs[3:])
+            else:
+                body.append(bl)
         for it in items:
             self._local_vars[var] = it
             self.run_lines(body)
@@ -229,7 +332,16 @@ class ScriptInterpreter:
                 if depth == 0:
                     break
             end += 1
-        body = lines[idx + 1:end]
+        raw_body_w = lines[idx + 1:end]
+        body = []
+        for bl in raw_body_w:
+            bs = bl.strip()
+            if bs == "do":
+                continue
+            if bs.startswith("do "):
+                body.append(bs[3:])
+            else:
+                body.append(bl)
         # loop until condition false (while) or true (until)
         is_until = header.startswith("until")
         while True:
@@ -257,20 +369,20 @@ class ScriptInterpreter:
     def _run_line(self, line: str):
         line = line.strip()
 
-        # Strip background operator & (we run synchronously – fine for simulation)
-        if line.endswith(" &") or line.endswith("&"):
-            line = line.rstrip("&").rstrip()
+        # Strip background operator & — run synchronously in simulation
+        # Handle:  cmd &    (cmd ...) &    cmd > /dev/null &
+        line = re.sub(r'\s*&\s*$', '', line).strip()
 
-        # Unwrap bare subshell grouping: ( cmd )  →  cmd
-        m_sub = re.match(r"^\((.+)\)\s*$", line)
+        # Unwrap bare subshell grouping: ( cmd args )  →  cmd args
+        # Must happen AFTER & strip so "(cmd) &" → "(cmd)" → "cmd"
+        m_sub = re.match(r'^\(\s*(.+?)\s*\)\s*$', line)
         if m_sub:
             line = m_sub.group(1).strip()
 
-        # Redirect to/from /dev/null  — silently discard
-        line = re.sub(r"\s+>\s*/dev/null", "", line)
-        line = re.sub(r"\s+2>/dev/null",   "", line)
-        line = re.sub(r"\s+&>/dev/null",   "", line)
-        line = re.sub(r"\s+>/dev/null\s+2>&1", "", line)
+        # Suppress /dev/null redirections silently
+        line = re.sub(r'\s+>\s*/dev/null(\s+2>&1)?', '', line)
+        line = re.sub(r'\s+2>/dev/null',              '', line)
+        line = re.sub(r'\s+&>/dev/null',              '', line)
 
         # support 'break' and 'continue' inside loops
         if line.strip() == "break":
@@ -390,13 +502,19 @@ class ScriptInterpreter:
 
 
     def _expand_braces(self, text: str) -> list:
-        """Expand {N..M} brace sequences like bash.  Returns list of words."""
-        m = re.match(r'^(.*?)\{(\d+)\.\.(\d+)\}(.*)$', text)
+        """Expand {N..M} or {N...M} brace sequences like bash.
+        Tolerates extra dots (common typo).  Returns list of words."""
+        m = re.match(r'^(.*?)\{(\d+)\.{2,3}(\d+)\}(.*)$', text)
         if not m:
             return [text]
         pre, lo, hi, post = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
         step = 1 if hi >= lo else -1
-        return [pre + str(i) + post for i in range(lo, hi + step, step)]
+        result = []
+        for i in range(lo, hi + step, step):
+            expanded = pre + str(i) + post
+            # recurse for nested braces
+            result.extend(self._expand_braces(expanded))
+        return result
 
     def _expand(self, text: str) -> str:
         """Expand variables, arithmetic, and command substitutions."""
