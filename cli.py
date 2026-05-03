@@ -57,3 +57,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+# TODO: 1. change command names to real names, update help so that it is adjust to all the tags of the updated version

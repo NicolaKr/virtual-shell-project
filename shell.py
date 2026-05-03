@@ -130,8 +130,8 @@ class Shell:
             Command("jobs",      "jobs",                        "list background jobs",             self.jobs_cmd),
             # network  (thin wrappers that delegate to commands/ modules)
             Command("ping",      "ping [-c N] <ip>",            "check if host is alive",           self.ping),
-            Command("scan",      "scan [prefix]",               "scan the network",                 self.scan),
-            Command("connect",   "connect <ip>",                "connect to a host",                self.connect),
+            Command("nmap",      "nmap [prefix]",               "scan the network (like nmap)",     self.nmap),
+            Command("ssh",       "ssh [-p port] [-l user] <ip>","connect to a remote host via SSH", self.ssh_cmd),
             Command("ifconfig",  "ifconfig",                    "network interface info",           self.ifconfig),
             Command("ip",        "ip [addr|route]",             "network info (modern)",            self.ip_cmd),
             Command("netstat",   "netstat [-tlnp]",             "network connections",              self.netstat),
@@ -241,7 +241,7 @@ class Shell:
         if (
             "=" in line
             and not line.startswith("export")
-            and not line.startswith("scan")
+            and not line.startswith("nmap")
             and not line.startswith("echo")
             and not line.startswith("printf")
         ):
@@ -1814,11 +1814,11 @@ class Shell:
         from commands.ping import run_ping
         run_ping(self, args)
 
-    def scan(self, args: list) -> None:
+    def nmap(self, args: list) -> None:
         from commands.scan import run_scan
         run_scan(self, args)
 
-    def connect(self, args: list) -> None:
+    def ssh_cmd(self, args: list) -> None:
         from commands.connect import run_connect
         run_connect(self, args)
 
@@ -2093,32 +2093,68 @@ class Shell:
                 ("ping 192.168.0.1",       "ping the gateway"),
                 ("ping -c 2 192.168.0.10", "send only 2 packets"),
             ],
-            "tip": "High rtt values mean a slow or congested link.",
+            "tip": "Low rtt = fast link. High rtt = slow or distant host.\nUse nmap instead of ping when you want to discover ALL hosts at once.",
         },
-        "scan": {
-            "desc": "Scan the virtual network and list all discovered hosts and open ports.",
-            "flags": [],
-            "examples": [
-                ("scan",             "scan entire 192.168.0.0/24 network"),
-                ("scan 192.168.0.1", "scan only hosts starting with that prefix"),
+        "nmap": {
+            "desc": (
+                "Scan the network and discover hosts, open ports, and running services.\n"
+                "nmap (Network Mapper) is a standard security tool used to explore networks.\n"
+                "Think of it like a sonar ping sent to every machine on the network –\n"
+                "each one that answers tells you it exists and what doors (ports) are open."
+            ),
+            "flags": [
+                ("-sV",        "detect service versions on open ports"),
+                ("-sn / -sP",  "ping scan only – discover hosts without port scanning"),
+                ("-A",         "aggressive scan: OS detection + version info"),
+                ("-v",         "verbose: print extra detail while scanning"),
+                ("<prefix>",   "only show hosts whose IP starts with <prefix>"),
             ],
-            "tip": "Note which ports are open – they tell you what services are running.",
+            "examples": [
+                ("nmap",                   "scan entire 192.168.0.0/24 network"),
+                ("nmap 192.168.0.",        "same, but filter to that prefix"),
+                ("nmap -sV",               "also show service version strings"),
+                ("nmap -sn",               "quick ping sweep – no port info"),
+            ],
+            "tip": (
+                "Read the output carefully:\n"
+                "  PORT       – the door number (22=SSH, 80=web, 3306=database …)\n"
+                "  STATE open – the service is running and accepting connections\n"
+                "  OS         – the operating system guess\n"
+                "  Auth       – whether a password is needed to log in\n"
+                "Once you spot an open SSH port, try: ssh <ip>"
+            ),
         },
-        "connect": {
-            "desc": "Connect to a network host via simulated SSH.",
-            "flags": [],
-            "examples": [
-                ("connect 192.168.0.1",  "connect to the gateway (no password)"),
-                ("connect 192.168.0.25", "connect to db-server (needs password)"),
+        "ssh": {
+            "desc": (
+                "Open a secure shell session on a remote host (SSH = Secure SHell).\n"
+                "SSH lets you log into another computer over the network and run\n"
+                "commands on it as if you were sitting in front of it."
+            ),
+            "flags": [
+                ("-p <port>",   "connect on a non-standard port (default is 22)"),
+                ("-l <user>",   "log in as a different username"),
             ],
-            "tip": "Scan first to find hosts, then try to connect. Some require passwords!",
+            "examples": [
+                ("ssh 192.168.0.42",           "connect to that IP (public host, no password)"),
+                ("ssh 192.168.0.77",           "connect – will prompt for a password if required"),
+                ("ssh -l admin 192.168.0.77",  "log in as user 'admin'"),
+                ("ssh -p 2222 192.168.0.77",   "connect on port 2222 instead of 22"),
+            ],
+            "tip": (
+                "Workflow:\n"
+                "  1. Run nmap to find hosts and see which have port 22 open\n"
+                "  2. ssh <ip> to connect\n"
+                "  3. If asked for a password, check scan output for hints\n"
+                "  4. Once inside, explore with ls, cat, find – look for hidden files!\n"
+                "  Type 'exit' or press Ctrl+D to disconnect and return home."
+            ),
         },
         "nano": {
             "desc": "Open the interactive text editor.",
             "flags": [],
             "examples": [
                 ("nano file.txt",        "open or create file.txt for editing"),
-                ("nano scripts/scan.sh", "edit a script"),
+                ("nano scripts/sweep.sh", "edit a script"),
             ],
             "tip": (
                 "Controls inside nano:\n"
@@ -2131,10 +2167,11 @@ class Shell:
             ),
         },
         "run": {
-            "desc": "Execute a shell script file. The file must have execute permission.",
+            "desc": "Execute a shell script file. The file must have execute permission (chmod +x).\nYou can also run scripts with ./script.sh – the ./ means 'in this directory'.",
             "flags": [],
             "examples": [
                 ("run myscript.sh",         "run a script in the current directory"),
+                ("./myscript.sh",           "same thing using the direct path syntax"),
                 ("run script.sh arg1 arg2", "pass arguments accessible as $1 $2"),
             ],
             "tip": "Don't forget: chmod +x script.sh before running it!",
@@ -2147,7 +2184,7 @@ class Shell:
                 ("chmod 755 script.sh", "rwx for owner, rx for group+others"),
                 ("chmod 644 file.txt",  "rw for owner, r for group+others"),
             ],
-            "tip": "Scripts must have +x before you can run them with 'run'.",
+            "tip": "Scripts must have +x before you can execute them (e.g. ./script.sh).",
         },
         "export": {
             "desc": "Set or display environment variables available to all commands.",
@@ -2265,7 +2302,7 @@ class Shell:
                                   "which", "whoami", "id", "hostname", "uname", "uptime", "date",
                                   "history", "sleep", "true", "false", "test", "env", "printenv", "xargs"],
                 "Process":      ["ps", "kill", "jobs"],
-                "Network":      ["ping", "scan", "connect", "ifconfig", "ip", "netstat",
+                "Network":      ["ping", "nmap", "ssh", "ifconfig", "ip", "netstat",
                                   "curl", "wget", "traceroute", "nslookup"],
                 "Scripting":    ["run", "source", "help", "man", "clear", "exit"],
             }

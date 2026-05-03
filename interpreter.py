@@ -52,6 +52,16 @@ class ScriptInterpreter:
                 idx += 1
                 continue
 
+            # Expand single-line compound commands joined by semicolons
+            # e.g. "for i in 1 2 3; do echo $i; done"  →  keep as-is (handled below)
+            # But bare semicolons outside a compound → split into multiple lines
+            if ";" in line and not re.match(r"^(for|while|until|if)\b", line):
+                sub_lines = [s.strip() for s in line.split(";") if s.strip()]
+                if len(sub_lines) > 1:
+                    # re-insert as separate lines and re-process
+                    lines = lines[:idx] + sub_lines + lines[idx+1:]
+                    continue
+
             # control structures
             if re.match(r"^if\b", line):
                 idx = self._handle_if(lines, idx)
@@ -168,13 +178,21 @@ class ScriptInterpreter:
     def _handle_for(self, lines: list[str], idx: int) -> int:
         # for VAR in ...; do ... done
         header = lines[idx].strip()
-        m = re.match(r"^for\s+(\w+)\s+in\s+(.*)", header)
+        # normalise:  "for i in list; do"  →  "for i in list"
+        header_clean = re.sub(r";?\s*do\s*$", "", header).strip()
+        m = re.match(r"^for\s+(\w+)\s+in\s+(.*)", header_clean)
         if not m:
             # malformed
             return idx + 1
         var = m.group(1)
         rest = m.group(2)
-        items = rest.split()
+        # strip trailing ; do
+        rest = re.sub(r";?\s*do\s*$", "", rest).strip()
+        # expand brace sequences like {1..254}
+        raw_items = rest.split()
+        items = []
+        for tok in raw_items:
+            items.extend(self._expand_braces(self._expand(tok)))
         # find done
         end = idx + 1
         depth = 1
@@ -237,12 +255,32 @@ class ScriptInterpreter:
     # line execution and helpers
     # ------------------------------------------------------------------
     def _run_line(self, line: str):
+        line = line.strip()
+
+        # Strip background operator & (we run synchronously – fine for simulation)
+        if line.endswith(" &") or line.endswith("&"):
+            line = line.rstrip("&").rstrip()
+
+        # Unwrap bare subshell grouping: ( cmd )  →  cmd
+        m_sub = re.match(r"^\((.+)\)\s*$", line)
+        if m_sub:
+            line = m_sub.group(1).strip()
+
+        # Redirect to/from /dev/null  — silently discard
+        line = re.sub(r"\s+>\s*/dev/null", "", line)
+        line = re.sub(r"\s+2>/dev/null",   "", line)
+        line = re.sub(r"\s+&>/dev/null",   "", line)
+        line = re.sub(r"\s+>/dev/null\s+2>&1", "", line)
+
         # support 'break' and 'continue' inside loops
         if line.strip() == "break":
             self._break_flag = True
             return
         if line.strip() == "continue":
             self._continue_flag = True
+            return
+        # wait – no-op in synchronous simulation
+        if re.match(r"^wait(\s|$)", line.strip()):
             return
 
         # variable assignment with local
@@ -350,6 +388,16 @@ class ScriptInterpreter:
         except Exception:
             return 0
 
+
+    def _expand_braces(self, text: str) -> list:
+        """Expand {N..M} brace sequences like bash.  Returns list of words."""
+        m = re.match(r'^(.*?)\{(\d+)\.\.(\d+)\}(.*)$', text)
+        if not m:
+            return [text]
+        pre, lo, hi, post = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
+        step = 1 if hi >= lo else -1
+        return [pre + str(i) + post for i in range(lo, hi + step, step)]
+
     def _expand(self, text: str) -> str:
         """Expand variables, arithmetic, and command substitutions."""
         if not text:
@@ -400,4 +448,3 @@ class ScriptInterpreter:
             text = text[1:-1]
 
         return text
-
