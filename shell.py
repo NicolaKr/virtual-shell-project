@@ -702,9 +702,17 @@ class Shell:
 
     def cd(self, args: list) -> None:
         if not args:
-            home = self.env.root.children.get("home")
-            if home:
-                self.env.cwd = home
+            # cd with no argument → go to $HOME (e.g. /home/student)
+            home_path = self.env.vars.get("HOME", "/home/student")
+            try:
+                target = self.resolve_path(home_path)
+                self.env.vars["OLDPWD"] = self.get_path(self.env.cwd)
+                self.env.cwd = target
+            except FileNotFoundError:
+                # Fallback: land in /home if $HOME node doesn't exist
+                home = self.env.root.children.get("home")
+                if home:
+                    self.env.cwd = home
             return
         try:
             node = self.resolve_path(args[0])

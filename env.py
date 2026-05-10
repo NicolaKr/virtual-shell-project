@@ -513,20 +513,10 @@ class VirtualEnvironment:
             "tmp": tmp, "usr": usr, "opt": opt,
         }
 
-        student_home = Node("student", home, is_dir=True, owner="student")
-        home.children["student"] = student_home
-        student_home.children = {
-            "notes.txt": Node("notes.txt", student_home, False,
-                              "hint: scan the network\ntarget range: 192.168.0.0/24"),
-            "readme.md": Node("readme.md", student_home, False,
-                              "# Cyber Lab\n\nObjective: find the codename hidden on the network.\n\n"
-                              "## Steps\n1. Scan the network (try: scan)\n"
-                              "2. Ping hosts to check latency (try: ping <ip>)\n"
-                              "3. Connect to a host (try: connect <ip>)\n"
-                              "4. Explore the filesystem\n5. Find the hidden codename"),
-            "scripts": Node("scripts", student_home, True),
-        }
-        student_home.children["scripts"].children = {}
+        self.student_home = Node("student", home, is_dir=True, owner="student")
+        home.children["student"] = self.student_home
+        # Default (no level): minimal files
+        self._build_default_home()
 
         etc.children["hosts"] = Node("hosts", etc, False,
             "127.0.0.1 localhost\n::1       localhost\n"
@@ -546,6 +536,95 @@ class VirtualEnvironment:
 
         self.generate_random_network(codename, num_public, num_private)
         self.authenticated = set()
+        # Start the user in their home directory
+        self.cwd = self.student_home
+
+    # ------------------------------------------------------------------
+    # Home directory builders
+    # ------------------------------------------------------------------
+
+    def _build_default_home(self):
+        """Minimal home — no level context."""
+        sh = self.student_home
+        sh.children = {
+            "notes.txt": Node("notes.txt", sh, False,
+                              "hint: scan the network\ntarget range: 192.168.0.0/24"),
+            "readme.md": Node("readme.md", sh, False,
+                              "# Cyber Lab\n\nObjective: find the codename hidden on the network.\n\n"
+                              "## Steps\n"
+                              "1. Scan the network (try: scan)\n"
+                              "2. Connect to a host (try: connect <ip>)\n"
+                              "3. Explore the filesystem\n"
+                              "4. Find the hidden codename"),
+            "scripts": Node("scripts", sh, True),
+        }
+        sh.children["scripts"].children = {}
+
+    def setup_level1(self):
+        """Level 1 home: guided intro — student just needs to scan and connect."""
+        sh = self.student_home
+        sh.children = {
+            "readme.md": Node("readme.md", sh, False,
+                "# Level 1 – Getting Started\n\n"
+                "Welcome to the Cyber Lab.\n\n"
+                "## Your mission\n"
+                "A secret codename is hidden on one of the hosts in this network.\n"
+                "Find it and submit it.\n\n"
+                "## Hints\n"
+                "- Find the correct server, connect to it and find the code word\n"
+                "- The codeword is hidden in a server which isn't password protected\n"
+                "- When you are connected to a server try to read first the readme.md\n"
+                "- If you have problem with using the commands try help\n"
+                "Good luck!\n"),
+        }
+
+    def setup_level2(self):
+        """Level 2 home: less hand-holding, introduce private hosts."""
+        sh = self.student_home
+        scripts = Node("scripts", sh, True, owner="student")
+        scripts.children = {
+            "recon.sh": Node("recon.sh", scripts, False,
+                "#!/bin/bash\n# Reconnaissance helper\n"
+                "# Usage: fill in the blanks and run with bash recon.sh\n\n"
+                "TARGET_RANGE=\"192.168.0\"\n"
+                "# Step 1: scan the range\n"
+                "# scan $TARGET_RANGE\n\n"
+                "# Step 2: connect to a promising host\n"
+                "# connect <ip>\n",
+                owner="student", permissions="rwxr-xr-x"),
+        }
+        sh.children = {
+            "readme.md": Node("readme.md", sh, False,
+                "# Level 2 – Go Deeper\n\n"
+                "The network has both public and private hosts now.\n"
+                "Private hosts require a password — you may need to look around\n"
+                "to find credentials.\n\n"
+                "## Tips\n"
+                "- Check log files on connected hosts (`/var/log/`)\n"
+                "- Look at `.bash_history` for clues\n"
+                "- The codename may be deeper in the filesystem this time\n"),
+            "scripts": scripts,
+            "notes.txt": Node("notes.txt", sh, False,
+                f"Reconnaissance notes\n"
+                f"Date: {_rand_date(3)}\n\n"
+                "- Remember to check /var/log/auth.log for login history\n"
+                "- Private hosts may expose passwords in config files\n"
+                "- Hidden directories can contain important files\n"),
+        }
+
+    def setup_level3(self):
+        """Level 3 home: minimal hints — student is on their own."""
+        sh = self.student_home
+        sh.children = {
+            "readme.md": Node("readme.md", sh, False,
+                "# Level 3 – Expert Mode\n\n"
+                "No hints this time. You know what to do.\n\n"
+                "Find the codename.\n"),
+            ".notes": Node(".notes", sh, False,
+                "# Private notes\n"
+                "Don't forget: always check hidden files and subdirectories.\n",
+                permissions="rw-------", owner="student"),
+        }
 
     def generate_random_network(self, codename: str, num_public: int = 5, num_private: int = 3):
         if num_public <= 0:

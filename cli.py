@@ -41,7 +41,8 @@ def _decrypt_codename(token: str) -> str:
 def main(
         commands: str | None = None,
         codename: str | None = None,
-        encrypted_codename: bool = True
+        encrypted_codename: bool = True,
+        task_level: int | None = None
 ):
     """Run the virtual shell.
 
@@ -79,8 +80,6 @@ def main(
     n_public  = 3
     n_private = 1
 
-    print("codename:", codename)
-
     if commands is None:
         p = argparse.ArgumentParser(
             description="Virtual Linux shell lab",
@@ -106,6 +105,12 @@ def main(
 
     # ── Build environment ──────────────────────────────────────────────────
     env   = VirtualEnvironment(codename, n_public, n_private)
+    if task_level == 1:
+        env.setup_level1()
+    elif task_level == 2:
+        env.setup_level2()
+    elif task_level == 3:
+        env.setup_level3()
     shell = Shell(env)
 
     # ── Non-interactive batch mode ─────────────────────────────────────────
@@ -141,7 +146,6 @@ def main(
 
     print("╔══════════════════════════════════════════════════╗")
     print("║         Cyber Shell Lab  –  Virtual Terminal     ║")
-    print(f"║         Code name:  {codename}                  ║")
     print("╠══════════════════════════════════════════════════╣")
     print(f"   Logged in as  {env.user}@{env.hostname:<20} ")
     print("║  Type  help   to see available commands          ║")
