@@ -518,7 +518,7 @@ class VirtualEnvironment:
         self.student_home = Node("student", home, is_dir=True, owner="student")
         home.children["student"] = self.student_home
         # Default (no level): minimal files
-        self._build_default_home()
+        # self.build_default_home()
 
         etc.children["hosts"] = Node("hosts", etc, False,
             "127.0.0.1 localhost\n::1       localhost\n"
