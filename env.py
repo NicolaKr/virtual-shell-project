@@ -498,6 +498,8 @@ class VirtualEnvironment:
         }
         self.user     = "student"
         self.hostname = "cyber-lab"
+        self.codename = codename
+
         self.last_exit_code = 0
 
         home = Node("home", self.root, permissions="rwxr-xr-x")
@@ -543,7 +545,11 @@ class VirtualEnvironment:
     # Home directory builders
     # ------------------------------------------------------------------
 
-    def _build_default_home(self):
+    def update_random_network(self, num_public: int = 5, num_private: int = 3):
+        self.generate_random_network(self.codename, num_public, num_private)
+
+
+    def build_default_home(self):
         """Minimal home — no level context."""
         sh = self.student_home
         sh.children = {

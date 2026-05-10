@@ -997,7 +997,8 @@ class Shell:
             results.append(path)
         if node.is_dir:
             for child in node.children.values():
-                self._find_recursive(child, f"{path}/{child.name}", name_pat, type_pat, results)
+                child_path = path.rstrip("/") + "/" + child.name
+                self._find_recursive(child, child_path, name_pat, type_pat, results)
 
     def echo(self, args: list) -> None:
         no_newline = args and args[0] == "-n"
