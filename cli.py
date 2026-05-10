@@ -1,41 +1,115 @@
 #!/usr/bin/env python3
 """CLI entrypoint for the virtual shell.
 
-Usage: python cli.py --codename CODE --public N --private M
+Usage (terminal):
+    python cli.py [--codename CODE] [--public N] [--private M] [--commands "cmd1 ; cmd2"]
+
+Usage (Jupyter / Python):
+    from cli import main
+    main(commands="ls ; echo hello ; cat readme")
 """
 import argparse
+import sys
 from env import VirtualEnvironment
-from shell import Shell, ShellCompleter
+from shell import Shell
+from completer import ShellCompleter
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--codename", default="enigma", help="codename to place on one public host")
-    p.add_argument("--public", type=int, default=3, help="number of public hosts to generate")
-    p.add_argument("--private", type=int, default=1, help="number of private hosts to generate")
-    args = p.parse_args()
+def main(commands: str = None):
+    """Run the virtual shell.
 
-    env = VirtualEnvironment(args.codename, args.public, args.private)
+    Parameters
+    ----------
+    commands:
+        Optional string of semicolon-separated commands to execute
+        non-interactively, then return.  When provided the REPL is
+        skipped.  You can also pass multiple lines by using '\\n'.
+
+        Example::
+
+            main(commands="ls ; echo hello ; cat readme.txt")
+    """
+    # ── Argument parsing (only when called from the command line) ──────────
+    # We reset sys.argv so Jupyter's kernel flags don't confuse argparse.
+    # When `commands` is passed programmatically we skip argparse entirely.
+    codename = "enigma"
+    n_public  = 3
+    n_private = 1
+
+    if commands is None:
+        p = argparse.ArgumentParser(
+            description="Virtual Linux shell lab",
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        )
+        p.add_argument("--codename", default="enigma",
+                       help="codename placed on one public host")
+        p.add_argument("--public",   type=int, default=3,
+                       help="number of public hosts to generate")
+        p.add_argument("--private",  type=int, default=1,
+                       help="number of private hosts to generate")
+        p.add_argument("--commands", default=None,
+                       help='semicolon-separated commands to run non-interactively, '
+                            'e.g. --commands "ls ; echo hello"')
+        # Strip Jupyter kernel flags so argparse doesn't choke
+        clean_argv = [a for a in sys.argv[1:]
+                      if not a.startswith("-f") and not a.endswith(".json")]
+        args = p.parse_args(clean_argv)
+        codename  = args.codename
+        n_public  = args.public
+        n_private = args.private
+        commands  = args.commands   # may still be None → interactive
+
+    # ── Build environment ──────────────────────────────────────────────────
+    env   = VirtualEnvironment(codename, n_public, n_private)
     shell = Shell(env)
-    completer = ShellCompleter(shell, env)
 
-    # Setup readline if available (virtual_shell already does this in main), keep minimal here
+    # ── Non-interactive batch mode ─────────────────────────────────────────
+    if commands is not None:
+        # Support both ';' and newline as command separators
+        # Split on newlines first, then let shell.run() handle semicolons
+        # (which now uses _semicolon_split internally).
+        lines = [ln.strip() for ln in commands.replace(";", "\n").splitlines()
+                 if ln.strip()]
+        for line in lines:
+            path   = shell.get_path(env.cwd)
+            prompt = f"{env.user}@{env.hostname}:{path}$ "
+            print(prompt + line)          # echo the command so output is readable
+            try:
+                shell.run(line)
+            except KeyboardInterrupt:
+                print("^C")
+                env.last_exit_code = 130
+            except SystemExit as e:
+                print(f"logout (exit code {e.code})")
+                break
+        return                            # done — no REPL
+
+    # ── Interactive REPL ───────────────────────────────────────────────────
+    completer = ShellCompleter(shell, env)
     try:
         import readline as _readline
         _readline.set_completer(completer.readline_match)
-        _readline.parse_and_bind('tab: complete')
+        _readline.parse_and_bind("tab: complete")
+        _readline.set_completer_delims(" \t\n;|&")
     except Exception:
         pass
 
-    # Launch REPL
+    print("╔══════════════════════════════════════════════════╗")
+    print("║         Cyber Shell Lab  –  Virtual Terminal     ║")
+    print("╠══════════════════════════════════════════════════╣")
+    print(f"   Logged in as  {env.user}@{env.hostname:<20} ")
+    print("║  Type  help   to see available commands          ║")
+    print("║  Arrow ↑/↓  history  |  Tab  autocomplete        ║")
+    print("╚══════════════════════════════════════════════════╝\n")
+
     try:
         while True:
-            path = shell.get_path(env.cwd)
+            path   = shell.get_path(env.cwd)
             prompt = f"{env.user}@{env.hostname}:{path}$ "
             try:
                 line = input(prompt)
             except EOFError:
-                print('\nlogout')
+                print("\nlogout")
                 break
             except KeyboardInterrupt:
                 print()
@@ -44,18 +118,21 @@ def main():
             if not line:
                 continue
             if line.strip() in ("exit", "logout"):
-                print('logout')
+                print("logout")
                 break
             try:
                 shell.run(line)
+            except KeyboardInterrupt:
+                print("^C")
+                env.last_exit_code = 130
             except SystemExit as e:
                 print(f"logout (exit code {e.code})")
                 break
     except KeyboardInterrupt:
-        print()  
+        print()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
 
 

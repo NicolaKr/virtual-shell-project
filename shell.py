@@ -249,6 +249,16 @@ class Shell:
         line = re.sub(r"\s+&>/dev/null",   "", line)
         line = re.sub(r"\s+>/dev/null\s+2>&1", "", line)
 
+        # Semicolon:  cmd1 ; cmd2 ; cmd3
+        # Split first (before pipe/&&/||) so each segment is dispatched
+        # independently.  _semicolon_split is already defined in this module
+        # and correctly ignores semicolons inside parentheses.
+        semi_parts = _semicolon_split(line)
+        if len(semi_parts) > 1:
+            for part in semi_parts:
+                self.run(part.strip())
+            return None
+
         # Pipe:  a | b | c
         if "|" in line and "||" not in line:
             segments = line.split("|")
