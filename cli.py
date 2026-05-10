@@ -113,7 +113,7 @@ def main(
         env.update_random_network(num_public=5, num_private=2)
     elif task_level == 2:
         env.setup_level2()
-        env.update_random_network(num_public=105, num_private=5)
+        env.update_random_network(num_public=305, num_private=5)
     elif task_level == 3:
         env.setup_level3()
     else:
