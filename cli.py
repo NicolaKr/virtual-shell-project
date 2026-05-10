@@ -9,26 +9,55 @@ Usage (Jupyter / Python):
     main(commands="ls ; echo hello ; cat readme")
 """
 import argparse
-import os
+import base64
 import sys
 from env import VirtualEnvironment
 from shell import Shell
 from completer import ShellCompleter
 
+KEY = 120
 
-def main(commands: str = None):
+
+def _encrypt_codename(plain: str) -> str:
+    """Encrypt a plain codename → opaque string safe to embed in a notebook cell.
+
+    Flow:  plain  ──b64encode──▶  bytes  ──XOR──▶  bytes  ──b64encode──▶  str
+    The outer b64 makes the result printable / copy-pasteable.
+    """
+    xored = bytes(b ^ KEY for b in base64.b64encode(plain.encode()))
+    return base64.b64encode(xored).decode()
+
+
+def _decrypt_codename(token: str) -> str:
+    """Reverse of _encrypt_codename.  Raises ValueError on bad token."""
+    try:
+        xored = base64.b64decode(token.encode())
+        inner = bytes(b ^ KEY for b in xored)
+        return base64.b64decode(inner).decode()
+    except Exception as exc:
+        raise ValueError(f"Invalid encrypted codename token: {token!r}") from exc
+
+
+def main(
+        commands: str | None = None,
+        codename: str | None = None,
+        encrypted_codename: bool = True
+):
     """Run the virtual shell.
 
     Parameters
     ----------
     commands:
         Optional string of semicolon-separated commands to execute
-        non-interactively, then return.  When provided the REPL is
-        skipped.  You can also pass multiple lines by using '\\n'.
+        non-interactively, then return. When provided the REPL is
+        skipped. You can also pass multiple lines by using '\n'.
 
-        Example::
+    codename:
+        Optional codename used for the virtual environment.
 
-            main(commands="ls ; echo hello ; cat readme.txt")
+    encrypted_codename:
+        If True, the codename is encoded/encrypted before use.
+        If False, it is used as plain text.
     """
     # ── Argument parsing (only when called from the command line) ──────────
     # We reset sys.argv so Jupyter's kernel flags don't confuse argparse.
@@ -36,7 +65,17 @@ def main(commands: str = None):
     # Allow the codename to be injected via environment variable so a parent
     # process (e.g. a challenge generator) can set it without it being visible
     # in the student's notebook cell.
-    codename  = os.environ.get("SHELL_CODENAME", "enigma")
+
+    # ── Resolve codename ───────────────────────────────────────────────────
+    # When called from a notebook the caller passes an encrypted token so the
+    # plain word is never visible in the cell.  We decrypt it here.
+    # When called from the CLI with --codename the value is already plain text
+    # (encrypted_codename=False path).
+    if codename is not None and encrypted_codename:
+        codename = _decrypt_codename(codename)   # token → plain word
+    elif codename is None:
+        codename = "enigma"
+
     n_public  = 3
     n_private = 1
 
@@ -97,7 +136,7 @@ def main(commands: str = None):
         _readline.set_completer(completer.readline_match)
         _readline.parse_and_bind("tab: complete")
         _readline.set_completer_delims(" \t\n;|&")
-    except Exception:
+    except (ImportError, AttributeError):
         pass
 
     print("╔══════════════════════════════════════════════════╗")
