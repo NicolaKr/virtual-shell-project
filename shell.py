@@ -2457,7 +2457,7 @@ def main() -> None:
     completer = ShellCompleter(shell, env)
 
     print("╔══════════════════════════════════════════════════╗")
-    print("║         Cyber Shell Lab 22 –  Virtual Terminal     ║")
+    print("║         Cyber Shell Lab  –  Virtual Terminal     ║")
     print("╠══════════════════════════════════════════════════╣")
     print(f"   Logged in as  {env.user}@{env.hostname:<20} ")
     print("║  Type  help   to see available commands          ║")

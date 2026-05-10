@@ -47,7 +47,7 @@ def main(commands: str = None):
             description="Virtual Linux shell lab",
             formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         )
-        p.add_argument("--codename", default="enigma",
+        p.add_argument("--codename", default=codename,
                        help="codename placed on one public host")
         p.add_argument("--public",   type=int, default=3,
                        help="number of public hosts to generate")
