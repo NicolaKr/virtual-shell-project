@@ -42,7 +42,7 @@ def main(
         commands: str | None = None,
         codename: str | None = None,
         encrypted_codename: bool = True,
-        task_level: int | None = None
+        task_level: int | None = None,
 ):
     """Run the virtual shell.
 
@@ -59,6 +59,9 @@ def main(
     encrypted_codename:
         If True, the codename is encoded/encrypted before use.
         If False, it is used as plain text.
+    task_level:
+        Optional task difficulty or scenario level used to configure
+        the virtual environment.
     """
     # ── Argument parsing (only when called from the command line) ──────────
     # We reset sys.argv so Jupyter's kernel flags don't confuse argparse.
@@ -77,8 +80,8 @@ def main(
     elif codename is None:
         codename = "enigma"
 
-    n_public  = 3
-    n_private = 1
+    n_public  = 5
+    n_private = 2
 
     if commands is None:
         p = argparse.ArgumentParser(
@@ -107,10 +110,14 @@ def main(
     env   = VirtualEnvironment(codename, n_public, n_private)
     if task_level == 1:
         env.setup_level1()
+        env.update_random_network(num_public=5, num_private=2)
     elif task_level == 2:
         env.setup_level2()
+        env.update_random_network(num_public=105, num_private=5)
     elif task_level == 3:
         env.setup_level3()
+    else:
+        env.build_default_home()
     shell = Shell(env)
 
     # ── Non-interactive batch mode ─────────────────────────────────────────
