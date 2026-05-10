@@ -9,6 +9,7 @@ Usage (Jupyter / Python):
     main(commands="ls ; echo hello ; cat readme")
 """
 import argparse
+import os
 import sys
 from env import VirtualEnvironment
 from shell import Shell
@@ -32,9 +33,14 @@ def main(commands: str = None):
     # ── Argument parsing (only when called from the command line) ──────────
     # We reset sys.argv so Jupyter's kernel flags don't confuse argparse.
     # When `commands` is passed programmatically we skip argparse entirely.
-    codename = "enigma"
+    # Allow the codename to be injected via environment variable so a parent
+    # process (e.g. a challenge generator) can set it without it being visible
+    # in the student's notebook cell.
+    codename  = os.environ.get("SHELL_CODENAME", "enigma")
     n_public  = 3
     n_private = 1
+
+    print("codename:", codename)
 
     if commands is None:
         p = argparse.ArgumentParser(
