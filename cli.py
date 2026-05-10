@@ -102,6 +102,7 @@ def main(commands: str = None):
 
     print("╔══════════════════════════════════════════════════╗")
     print("║         Cyber Shell Lab  –  Virtual Terminal     ║")
+    print(f"║         Code name:  {codename}                  ║")
     print("╠══════════════════════════════════════════════════╣")
     print(f"   Logged in as  {env.user}@{env.hostname:<20} ")
     print("║  Type  help   to see available commands          ║")
