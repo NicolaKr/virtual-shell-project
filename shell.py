@@ -2424,11 +2424,6 @@ class Shell:
     # HELP / MAN  –  content and rendering live in helper.py
     # =========================================================
 
-    try:
-        from helper import HELP_DETAIL
-    except ImportError:
-        HELP_DETAIL: dict = {}
-
     def help(self, args: list = None) -> None:
         from commands.helper import render_help
         render_help(self, args)

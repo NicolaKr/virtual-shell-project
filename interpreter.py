@@ -190,6 +190,18 @@ class ScriptInterpreter:
                 return val
 
             # normal line
+            # ssh from a script: pass remaining lines as non-interactive commands
+            if re.match(r'^ssh', line):
+                import shlex as _shlex
+                expanded = self._expand(line)
+                try:
+                    parts = _shlex.split(expanded)
+                except Exception:
+                    parts = expanded.split()
+                remaining = [l.strip() for l in lines[idx+1:] if l.strip()]
+                from commands.connect import run_connect
+                run_connect(self.shell, parts[1:], commands=remaining)
+                return self._return_value or 0
             self._run_line(line)
             if self._return_value is not None:
                 return self._return_value
@@ -404,11 +416,13 @@ class ScriptInterpreter:
         rest = m.group(2)
         # strip trailing ; do
         rest = re.sub(r";?\s*do\s*$", "", rest).strip()
-        # expand brace sequences like {1..254}
-        raw_items = rest.split()
+        # Expand command substitutions BEFORE word-splitting so that
+        # "$(cat file)" isn't split into "$(cat" and "file)".
+        rest_expanded = self._expand(rest)
+        raw_items = rest_expanded.split()
         items = []
         for tok in raw_items:
-            items.extend(self._expand_braces(self._expand(tok)))
+            items.extend(self._expand_braces(tok))
         # find done
         end = idx + 1
         depth = 1
@@ -444,48 +458,122 @@ class ScriptInterpreter:
 
     def _handle_while(self, lines: list[str], idx: int) -> int:
         header = lines[idx].strip()
-        cond = header.split(None, 1)[1] if " " in header else ""
-        end = idx + 1
-        depth = 1
-        while end < len(lines) and depth > 0:
-            if re.match(r"^while\b", lines[end].strip()) or re.match(r"^until\b", lines[end].strip()):
-                depth += 1
-            if lines[end].strip() == "done":
-                depth -= 1
-                if depth == 0:
-                    break
-            end += 1
-        raw_body_w = lines[idx + 1:end]
-        body = []
-        for bl in raw_body_w:
-            bs = bl.strip()
-            if bs == "do":
-                continue
-            if bs.startswith("do "):
-                body.append(bs[3:])
-            else:
-                body.append(bl)
-        # loop until condition false (while) or true (until)
+
         is_until = header.startswith("until")
+
+        # extract condition part after "while"/"until"
+        cond = header.split(None, 1)[1] if " " in header else ""
+
+        # ------------------------------------------------------------
+        # 1. SPECIAL CASE: while read VAR [< file]
+        # ------------------------------------------------------------
+        import re
+
+        m = re.search(
+            r'^(?:IFS=\S*\s+)?read(?:\s+-r)?\s+(\w+)(?:\s*<\s*(\S+))?$',
+            cond.strip()
+        )
+
+        redirect_file = None
+        read_var = None
+
+        if m:
+            read_var = m.group(1)
+            redirect_file = m.group(2)
+
+            # also allow:  while IFS= read -r var < file   (header-level redirect)
+            if redirect_file is None:
+                redir = re.search(r'<\s*(\S+)', header)
+                if redir:
+                    redirect_file = redir.group(1)
+
+        # ------------------------------------------------------------
+        # 2. parse body
+        # ------------------------------------------------------------
+        body = []
+        i = idx + 1
+        depth = 0
+
+        done_line = ""
+        while i < len(lines):
+            line = lines[i].strip()
+
+            if line.startswith("while") or line.startswith("until") or line.startswith("if") or line.startswith("for"):
+                depth += 1
+            elif re.match(r'^done\b', line):
+                if depth == 0:
+                    done_line = line
+                    break
+                depth -= 1
+
+            # skip bare 'do' delimiter (same as _handle_for does)
+            if line != "do" and not line.startswith("do "):
+                body.append(line)
+            elif line.startswith("do ") and line != "do":
+                body.append(line[3:])
+            i += 1
+
+        end = i
+
+        # Pick up "< file" from "done < file" if not on the header line
+        if m and redirect_file is None:
+            redir = re.search(r'<\s*(\S+)', done_line)
+            if redir:
+                redirect_file = redir.group(1)
+
+        # ------------------------------------------------------------
+        # 3. HANDLE read-loop mode (NEW BEHAVIOR)
+        # ------------------------------------------------------------
+        if read_var and redirect_file:
+            try:
+                node = self.shell._get_or_create_file(redirect_file)
+                file_lines = node.content.splitlines()
+            except Exception:
+                file_lines = []
+
+            for line in file_lines:
+                # assign variable (bash-style)
+                self._local_vars[read_var] = line
+                self.env.vars[read_var] = line
+
+                self.run_lines(body)
+
+                if self._break_flag:
+                    self._break_flag = False
+                    break
+
+                if self._continue_flag:
+                    self._continue_flag = False
+                    continue
+
+            return end + 1
+
+        # ------------------------------------------------------------
+        # 4. FALLBACK: normal while/until evaluation
+        # ------------------------------------------------------------
         while True:
             si = ScriptInterpreter(self.shell)
-            si._local_vars = dict(self._local_vars)
-            res = si._eval_test(cond)
+
+            condition_result = si.run_lines([cond])
+
+            cond_true = bool(condition_result)
             if is_until:
-                ok = not res
-            else:
-                ok = res
-            if not ok:
+                cond_true = not cond_true
+
+            if not cond_true:
                 break
-            self.run_lines(body)
+
+            si.run_lines(body)
+
             if self._break_flag:
                 self._break_flag = False
                 break
+
             if self._continue_flag:
                 self._continue_flag = False
                 continue
-        return end + 1
 
+        return end + 1
     # ------------------------------------------------------------------
     # line execution and helpers
     # ------------------------------------------------------------------
@@ -506,6 +594,62 @@ class ScriptInterpreter:
         line = re.sub(r'\s+>\s*/dev/null(\s+2>&1)?', '', line)
         line = re.sub(r'\s+2>/dev/null',              '', line)
         line = re.sub(r'\s+&>/dev/null',              '', line)
+
+        # && / || short-circuit operators
+        # Handle:  [[ expr ]] && cmd   or   cmd1 && cmd2   or   cmd1 || cmd2
+        # Must be done before variable assignment check.
+        # Split only on top-level && / || (not inside quotes or [[ ]]).
+        def _split_logic(s):
+            parts = []
+            buf = ""
+            in_q = None
+            i = 0
+            while i < len(s):
+                c = s[i]
+                if in_q:
+                    buf += c
+                    if c == in_q:
+                        in_q = None
+                elif c in ('"', "'"):
+                    in_q = c
+                    buf += c
+                elif s[i:i+2] in ("&&", "||"):
+                    parts.append((buf.strip(), s[i:i+2]))
+                    buf = ""
+                    i += 2
+                    continue
+                else:
+                    buf += c
+                i += 1
+            if buf.strip():
+                parts.append((buf.strip(), None))
+            return parts
+
+        if "&&" in line or "||" in line:
+            logic_parts = _split_logic(line)
+            if len(logic_parts) > 1:
+                for part_cmd, op in logic_parts:
+                    if not part_cmd:
+                        continue
+                    # [[ expr ]] — evaluate as test, set exit code
+                    m_dbl = re.match(r'^\[\[\s*(.*?)\s*\]\]$', part_cmd)
+                    if m_dbl:
+                        result = self._eval_test(part_cmd)
+                        self.env.last_exit_code = 0 if result else 1
+                    else:
+                        self._run_line(part_cmd)
+                    if op == "&&" and self.env.last_exit_code != 0:
+                        break
+                    if op == "||" and self.env.last_exit_code == 0:
+                        break
+                return
+
+        # [[ expr ]] standalone
+        m_dbl = re.match(r'^\[\[\s*(.*?)\s*\]\]$', line)
+        if m_dbl:
+            result = self._eval_test(line)
+            self.env.last_exit_code = 0 if result else 1
+            return
 
         # support 'break' and 'continue' inside loops
         if line.strip() == "break":
@@ -665,10 +809,28 @@ class ScriptInterpreter:
             text
         )
 
+        # ${VAR%pattern}  -- strip shortest suffix
+        def _strip_suffix(m):
+            val = self._local_vars.get(m.group(1), self.env.vars.get(m.group(1), ""))
+            pat = m.group(2).strip('\"\' ')
+            if pat and val.endswith(pat):
+                return val[:-len(pat)]
+            return val
+        text = re.sub(r"\$\{(\w+)%([^}]*)\}", _strip_suffix, text)
+
+        # ${VAR#pattern}  -- strip shortest prefix
+        def _strip_prefix(m):
+            val = self._local_vars.get(m.group(1), self.env.vars.get(m.group(1), ""))
+            pat = m.group(2).strip('\"\' ')
+            if pat and val.startswith(pat):
+                return val[len(pat):]
+            return val
+        text = re.sub(r"\$\{(\w+)#([^}]*)\}", _strip_prefix, text)
+
         # ${VAR}
         text = re.sub(
             r"\$\{(\w+)\}",
-            lambda m: str(self.env.vars.get(m.group(1), self._local_vars.get(m.group(1), ""))),
+            lambda m: str(self._local_vars.get(m.group(1), self.env.vars.get(m.group(1), ""))),
             text
         )
 

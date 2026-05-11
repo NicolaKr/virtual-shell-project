@@ -35,13 +35,14 @@ def _fake_ed25519():
 # Main entry
 # ---------------------------------------------------------------------------
 
-def run_connect(shell, args: list) -> None:
+def run_connect(shell, args: list, commands: list = None) -> None:
     """Simulate an SSH connection to a virtual host."""
     # Parse: connect [-p port] [-l user] <ip>
     ip        = None
     port      = 22
     req_user  = None
     i = 0
+    auto_yes = False
     while i < len(args):
         if args[i] == "-p" and i + 1 < len(args):
             try:
@@ -52,6 +53,9 @@ def run_connect(shell, args: list) -> None:
         elif args[i] == "-l" and i + 1 < len(args):
             req_user = args[i + 1]
             i += 2
+        elif args[i] == "-y":
+            auto_yes = True
+            i += 1
         elif not args[i].startswith("-"):
             ip = args[i]
             i += 1
@@ -92,19 +96,22 @@ def run_connect(shell, args: list) -> None:
     fp = _fake_ed25519()
     print(f"debug1: Server host key: ecdsa-sha2-nistp256 {fp}")
 
-    # First-time host key warning (realistic)
+    # First-time host key warning — skipped with -y or when scripted
     if ip not in shell.env.authenticated:
-        print(f"The authenticity of host '{ip} ({ip})' can't be established.")
-        print(f"ECDSA key fingerprint is {fp}.")
-        try:
-            ans = input("Are you sure you want to continue connecting (yes/no/[fingerprint])? ")
-        except EOFError:
-            ans = "yes"
-        if ans.strip().lower() not in ("yes", "y", fp):
-            print("Host key verification failed.")
-            shell.env.last_exit_code = 255
-            return
-        print(f"Warning: Permanently added '{ip}' (ECDSA) to the list of known hosts.")
+        if auto_yes or commands is not None:
+            print(f"Warning: Permanently added '{ip}' (ECDSA) to the list of known hosts.")
+        else:
+            print(f"The authenticity of host '{ip} ({ip})' can't be established.")
+            print(f"ECDSA key fingerprint is {fp}.")
+            try:
+                ans = input("Are you sure you want to continue connecting (yes/no/[fingerprint])? ")
+            except EOFError:
+                ans = "yes"
+            if ans.strip().lower() not in ("yes", "y", fp):
+                print("Host key verification failed.")
+                shell.env.last_exit_code = 255
+                return
+            print(f"Warning: Permanently added '{ip}' (ECDSA) to the list of known hosts.")
 
     time.sleep(0.05)
 
@@ -209,7 +216,30 @@ def run_connect(shell, args: list) -> None:
     print(f"--- Connected to {name} ({ip}). Type 'exit' or Ctrl+D to disconnect ---")
     print()
 
-    # --- REPL ---
+    # --- Non-interactive (scripted) mode ---
+    if commands is not None:
+        for cmd in commands:
+            cmd = cmd.strip()
+            if not cmd:
+                continue
+            if cmd in ("exit", "logout"):
+                print("logout")
+                break
+            try:
+                new_shell.run(cmd)
+            except SystemExit:
+                break
+        shell.env.last_exit_code = new_env.last_exit_code
+        time.sleep(0.04)
+        print(f"debug1: client_loop: send disconnect: Disconnected from user {auth_user} {ip} port {port}")
+        if _RL_AVAILABLE and old_completer is not None:
+            try:
+                _readline.set_completer(old_completer)
+            except Exception:
+                pass
+        return
+
+    # --- Interactive REPL ---
     while True:
         try:
             path       = new_shell.get_path(new_env.cwd)
@@ -246,7 +276,7 @@ def run_connect(shell, args: list) -> None:
         except Exception:
             pass
 
-    shell.env.last_exit_code = 0
+    shell.env.last_exit_code = new_env.last_exit_code
 
 HELP = {
     "ssh": {

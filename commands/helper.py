@@ -283,6 +283,120 @@ _NETWORK: dict = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Shell scripting / interpreter (NEW)
+# ---------------------------------------------------------------------------
+
+_SHELL_SCRIPT_COMMANDS: dict = {
+    "overview": {
+        "desc": (
+            "Shell scripting support includes control flow (if/for/while/until), "
+            "pipes, variables, redirections, and command substitution. "
+            "This is NOT a command you run directly, but a reference section for scripting syntax."
+        )
+    },
+
+    "while_read": {
+        "desc": "Common pattern: reading input line-by-line (e.g. from files or pipes).",
+        "examples": [
+            (
+                "while IFS= read -r ip; do\n"
+                "    echo $ip\n"
+                "done < hosts.txt",
+                "iterate over each line in a file safely"
+            ),
+            (
+                "cat hosts.txt | while IFS= read -r ip; do\n"
+                "    ping -c 1 $ip\n"
+                "done",
+                "process piped input line-by-line"
+            ),
+        ],
+        "explanation": (
+            "IFS= prevents trimming whitespace.\n"
+            "read -r prevents backslash escaping.\n"
+            "Each iteration assigns one line to variable (e.g. ip)."
+        )
+    },
+
+    "loops": {
+        "desc": "Loop constructs available in the interpreter.",
+        "examples": [
+            ("for i in 1 2 3; do echo $i; done", "basic iteration"),
+            ("while true; do date; sleep 1; done", "infinite loop"),
+            ("until ping -c 1 8.8.8.8; do sleep 1; done", "retry until condition succeeds"),
+        ],
+        "explanation": (
+            "for: iterates over a list\n"
+            "while: runs while exit code == 0\n"
+            "until: runs until exit code == 0 (inverse of while)\n"
+            "break: exits loop\n"
+            "continue: skips to next iteration"
+        )
+    },
+
+    "pipes": {
+        "desc": "Connect commands using | so output of one becomes input of another.",
+        "examples": [
+            ("cat file | grep error | sort | uniq", "filter pipeline"),
+            ("ps aux | awk '{print $1}'", "extract column data"),
+        ],
+        "explanation": (
+            "Pipes pass stdout between commands.\n"
+            "Each stage runs in sequence inside the interpreter."
+        )
+    },
+
+    "variables": {
+        "desc": "Shell variables and environment variables.",
+        "examples": [
+            ("NAME=alice", "local variable assignment"),
+            ("export PATH=/usr/bin", "environment variable"),
+            ("echo $NAME", "variable expansion"),
+        ],
+        "explanation": (
+            "$VAR expands variable\n"
+            "${VAR} for safe parsing\n"
+            "export makes variable global to subprocesses"
+        )
+    },
+
+    "read": {
+        "desc": "Read input from stdin into a variable.",
+        "examples": [
+            ("read name", "waits for user input"),
+            ("while read line; do echo $line; done", "process stream"),
+        ],
+        "explanation": (
+            "read assigns stdin line into variable.\n"
+            "Used heavily in loops and pipelines."
+        )
+    },
+
+    "redirection": {
+        "desc": "Redirect output/input streams.",
+        "examples": [
+            ("echo hi > file.txt", "overwrite file"),
+            ("echo hi >> file.txt", "append to file"),
+            ("cmd 2> error.log", "redirect stderr"),
+        ],
+        "explanation": (
+            "> overwrite\n>> append\n2> stderr\n&> stdout+stderr"
+        )
+    },
+
+    "control_flow": {
+        "desc": "if / then / else / fi and related constructs.",
+        "examples": [
+            ("if ping -c 1 host; then echo ok; else echo fail; fi", "basic condition"),
+        ],
+        "explanation": (
+            "if checks exit code of command.\n"
+            "0 = true, non-zero = false."
+        )
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Load HELP dicts from the three network command modules (ping, scan, connect)
@@ -344,6 +458,33 @@ def render_help(shell: "Shell", args: list | None) -> None:
                 for i, ln in enumerate(tip_lines):
                     print(f"  ║  {'TIP: ' if i == 0 else '      '}{ln}")
             print(f"  ╚{'═' * 50}\n")
+        elif cmd_name == "shell_script_commands":
+            d = _SHELL_SCRIPT_COMMANDS["overview"]
+
+            print("\n  ╔══ SHELL SCRIPT COMMANDS ══")
+            print(f"  ║  {d['desc']}")
+            print(f"  ║")
+            print(f"  ║  This is NOT a command — it is a reference section.")
+            print(f"  ║")
+
+            for section, content in _SHELL_SCRIPT_COMMANDS.items():
+                if section == "overview":
+                    continue
+
+                print(f"\n  ║  [{section.upper()}]")
+                print(f"  ║  {content['desc']}")
+
+                if "explanation" in content:
+                    print(f"  ║\n  ║  {content['explanation']}")
+
+                if "examples" in content:
+                    print(f"  ║\n  ║  EXAMPLES:")
+                    for ex, desc in content["examples"]:
+                        print(f"  ║    $ {ex}")
+                        print(f"  ║      → {desc}")
+
+            print(f"  ╚{'═' * 50}\n")
+            return
         elif cmd_name in shell.commands:
             cmd = shell.commands[cmd_name]
             print(f"\n  {cmd.usage}\n  {cmd.description}\n")
@@ -352,7 +493,9 @@ def render_help(shell: "Shell", args: list | None) -> None:
     else:
         print("\n  Cyber Shell Lab — Command Reference")
         print("  " + "─" * 50)
-        print("  Tip: type  help <command>  for detailed help with examples\n")
+        print("  Tip: type  help <command>  for detailed help with examples")
+        print("  Tip: type  help shell_script_commands  for scripting reference (if/for/while/pipes/read)")
+        print("  Tip: scripting help is NOT a command — it's documentation\n")
         groups = {
             "File System":  ["ls", "cd", "pwd", "cat", "nano", "mkdir", "touch", "rm", "cp", "mv",
                               "grep", "find", "head", "tail", "wc", "sort", "uniq", "cut", "diff",
