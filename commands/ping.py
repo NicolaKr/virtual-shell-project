@@ -93,3 +93,19 @@ def run_ping(shell, args: list) -> None:
         print(f"rtt min/avg/max/mdev = {mn}/{avg}/{mx}/{mdev} ms")
 
     shell.env.last_exit_code = 0 if received > 0 else 1
+
+HELP = {
+    "ping": {
+        "desc": "Check if a remote host is reachable and measure latency.",
+        "flags": [
+            ("-c N",        "send only N packets (default 4)"),
+            ("-i interval", "wait interval seconds between packets"),
+            ("-W timeout",  "time to wait for a response"),
+        ],
+        "examples": [
+            ("ping 192.168.0.1",       "ping the gateway"),
+            ("ping -c 2 192.168.0.10", "send only 2 packets"),
+        ],
+        "tip": "Low rtt = fast link. High rtt = slow or distant host.\nUse nmap instead of ping when you want to discover ALL hosts at once.",
+    },
+}

@@ -5,6 +5,7 @@ import time
 
 from env import Node, VirtualEnvironment, build_remote_filesystem
 from completer import ShellCompleter
+from shell import Shell
 
 try:
     import readline as _readline
@@ -165,8 +166,6 @@ def run_connect(shell, args: list) -> None:
             return
 
     # --- Build remote environment ---
-    from shell import Shell
-
     new_env          = VirtualEnvironment()
     new_env.network  = shell.env.network
     new_env.hostname = name
@@ -248,3 +247,31 @@ def run_connect(shell, args: list) -> None:
             pass
 
     shell.env.last_exit_code = 0
+
+HELP = {
+    "ssh": {
+        "desc": (
+            "Open a secure shell session on a remote host (SSH = Secure SHell).\n"
+            "SSH lets you log into another computer over the network and run\n"
+            "commands on it as if you were sitting in front of it."
+        ),
+        "flags": [
+            ("-p <port>", "connect on a non-standard port (default is 22)"),
+            ("-l <user>", "log in as a different username"),
+        ],
+        "examples": [
+            ("ssh 192.168.0.42",          "connect to a public host (no password)"),
+            ("ssh 192.168.0.77",          "connect – will prompt for password if required"),
+            ("ssh -l admin 192.168.0.77", "log in as user 'admin'"),
+            ("ssh -p 2222 192.168.0.77",  "connect on port 2222 instead of 22"),
+        ],
+        "tip": (
+            "Workflow:\n"
+            "  1. Run nmap to find hosts and check which have port 22 open\n"
+            "  2. ssh <ip> to connect\n"
+            "  3. If asked for a password, check scan output for hints\n"
+            "  4. Once inside, explore with ls, cat, find – look for hidden files!\n"
+            "  Type 'exit' or Ctrl+D to disconnect and return home."
+        ),
+    },
+}

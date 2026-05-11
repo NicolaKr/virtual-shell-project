@@ -108,7 +108,7 @@ def run_scan(shell, args: list) -> None:
         mac        = _mac_for_ip(ip)
         os_info    = _OS_CPE.get(os_name, ("Linux", "cpe:/o:linux:linux_kernel"))
 
-        print(f"\nNmap scan report for {name} ({ip})")
+        print(f"Nmap scan report for {name} ({ip})")
         print(f"Host is up ({latency}ms latency).")
 
         if not is_public:
@@ -170,3 +170,31 @@ def run_scan(shell, args: list) -> None:
     print(f"\nNmap done: 254 IP addresses ({total} host{'s' if total != 1 else ''} up) "
           f"scanned in {elapsed} seconds")
     shell.env.last_exit_code = 0
+
+HELP = {
+    "nmap": {
+        "desc": (
+            "Scan the network and discover hosts, open ports, and running services.\n"
+            "nmap (Network Mapper) is a standard security tool used to explore networks."
+        ),
+        "flags": [
+            ("-sV",       "detect service versions on open ports"),
+            ("-sn / -sP", "ping scan only – discover hosts without port scanning"),
+            ("-A",        "aggressive scan: OS detection + version info"),
+            ("-v",        "verbose: print extra detail while scanning"),
+            ("<prefix>",  "only show hosts whose IP starts with <prefix>"),
+        ],
+        "examples": [
+            ("nmap 192.168",     "scan entire 192.168.0.0/24 network"),
+            ("nmap -sV 192.168", "also show service version strings"),
+            ("nmap -sn 192.168", "quick ping sweep – no port info"),
+        ],
+        "tip": (
+            "Read the output carefully:\n"
+            "  PORT       – the door number (22=SSH, 80=web, 3306=database …)\n"
+            "  STATE open – the service is running and accepting connections\n"
+            "  Auth       – whether a password is needed to log in\n"
+            "Once you spot an open host, try: ssh <ip>"
+        ),
+    },
+}

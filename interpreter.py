@@ -21,6 +21,7 @@ class ScriptInterpreter:
       - break / continue
       - Output redirection  >  >>  2>  &>
       - Pipes  |
+      - Brace groups  { … } [> file]
       - Functions  name() { … }
       - local VAR=val
       - return N
@@ -41,6 +42,45 @@ class ScriptInterpreter:
         if extra_vars:
             self._local_vars.update(extra_vars)
 
+        # Pre-pass: join lines where a single quote is opened but not closed.
+        # This handles multiline awk '...' blocks written across several lines.
+        joined: list[str] = []
+        pending = ""
+        for raw in lines:
+            if pending:
+                pending += " " + raw
+            else:
+                pending = raw
+            # count unescaped single quotes
+            if pending.count("'") % 2 == 0:
+                joined.append(pending)
+                pending = ""
+        if pending:
+            joined.append(pending)  # unclosed quote at EOF – try anyway
+        lines = joined
+
+        # Pre-pass: join pipe-continuation lines (lines ending with a bare |).
+        # e.g.   nmap 192.168 |
+        #        awk '...' |
+        #        sort -u
+        # becomes a single line: nmap 192.168 | awk '...' | sort -u
+        pipe_joined: list[str] = []
+        pipe_pending = ""
+        for raw in lines:
+            stripped = raw.strip()
+            if pipe_pending:
+                pipe_pending = pipe_pending.rstrip() + " " + stripped
+            else:
+                pipe_pending = stripped
+            # A line ending with | (not ||) means continuation
+            if re.search(r'(?<!\|)\|(?!\|)\s*$', pipe_pending):
+                continue   # keep accumulating
+            pipe_joined.append(pipe_pending)
+            pipe_pending = ""
+        if pipe_pending:
+            pipe_joined.append(pipe_pending)
+        lines = pipe_joined
+
         # Pre-pass: expand one-liner compound commands into multi-line form.
         # e.g. "for i in a b; do echo $i; done"
         #   -> ["for i in a b", "do", "echo $i", "done"]
@@ -60,12 +100,76 @@ class ScriptInterpreter:
             # Expand single-line compound commands joined by semicolons
             # e.g. "for i in 1 2 3; do echo $i; done"  →  keep as-is (handled below)
             # But bare semicolons outside a compound → split into multiple lines
+            # Quote-aware: don't split on ; inside single or double quotes
             if ";" in line and not re.match(r"^(for|while|until|if)\b", line):
-                sub_lines = [s.strip() for s in line.split(";") if s.strip()]
+                def _qsemi_split(s):
+                    parts, buf, in_q, depth = [], [], None, 0
+                    for ch in s:
+                        if in_q:
+                            buf.append(ch)
+                            if ch == in_q: in_q = None
+                        elif ch in ('"', "'"):
+                            in_q = ch; buf.append(ch)
+                        elif ch == "{":
+                            depth += 1; buf.append(ch)
+                        elif ch == "}":
+                            depth -= 1; buf.append(ch)
+                        elif ch == ";" and depth == 0:
+                            parts.append("".join(buf).strip())
+                            buf = []
+                        else:
+                            buf.append(ch)
+                    parts.append("".join(buf).strip())
+                    return [p for p in parts if p]
+                sub_lines = _qsemi_split(line)
                 if len(sub_lines) > 1:
                     # re-insert as separate lines and re-process
                     lines = lines[:idx] + sub_lines + lines[idx+1:]
                     continue
+
+            # Brace group:  { … }  or  { … } > file  or  { … } >> file
+            # Handles the case where { is on its own line (multi-line brace group).
+            if line == "{":
+                body_lines = []
+                idx += 1
+                depth = 1
+                while idx < len(lines) and depth > 0:
+                    l = lines[idx].strip()
+                    if l == "{":
+                        depth += 1
+                        body_lines.append(l)
+                    elif l.startswith("}"):
+                        depth -= 1
+                        if depth == 0:
+                            # check for redirect:  } > file  or  } >> file
+                            m_redir = re.match(r'^\}\s*(>>?)\s+(\S+)', l)
+                            if m_redir:
+                                op, dest = m_redir.group(1), m_redir.group(2)
+                                buf = io.StringIO()
+                                old = sys.stdout
+                                sys.stdout = buf
+                                try:
+                                    self.run_lines(list(body_lines))
+                                finally:
+                                    sys.stdout = old
+                                result = buf.getvalue()
+                                try:
+                                    node = self.shell._get_or_create_file(dest)
+                                    if ">>" in op:
+                                        node.content += result
+                                    else:
+                                        node.content = result
+                                    node.touch_mtime()
+                                except Exception as e:
+                                    print(f"bash: {e}")
+                            else:
+                                self.run_lines(list(body_lines))
+                        else:
+                            body_lines.append(l)
+                    else:
+                        body_lines.append(l)
+                    idx += 1
+                continue
 
             # control structures
             if re.match(r"^if\b", line):
@@ -112,15 +216,34 @@ class ScriptInterpreter:
                 result.append(raw)
                 continue
 
-            is_compound = re.match(r'^(for|while|until|if)', line)
+            is_compound = re.match(r'^(for|while|until|if)', line)
 
             if ";" not in line or not is_compound:
-                # Not a compound one-liner – split on plain semicolons
+                # Not a compound one-liner – split on plain semicolons (quote-aware)
                 if ";" in line and not is_compound:
-                    for part in line.split(";"):
-                        p = part.strip()
-                        if p:
-                            result.append(p)
+                    def _qsemi(s):
+                        parts, buf, in_q, depth = [], [], None, 0
+                        for ch in s:
+                            if in_q:
+                                buf.append(ch)
+                                if ch == in_q: in_q = None
+                            elif ch in ('"', "'"):
+                                in_q = ch; buf.append(ch)
+                            elif ch == "{":
+                                depth += 1; buf.append(ch)
+                            elif ch == "}":
+                                depth -= 1; buf.append(ch)
+                            elif ch == ";" and depth == 0:
+                                p = "".join(buf).strip()
+                                if p: parts.append(p)
+                                buf = []
+                            else:
+                                buf.append(ch)
+                        p = "".join(buf).strip()
+                        if p: parts.append(p)
+                        return parts
+                    for part in _qsemi(line):
+                        result.append(part)
                 else:
                     result.append(raw)
                 continue
@@ -444,7 +567,7 @@ class ScriptInterpreter:
             return
 
         # delegate to shell
-        self.shell.run(self._expand(line))
+        self.shell.run(line)
 
     def _capture_line(self, line: str) -> str:
         """Run a line, capture stdout, return as string."""
@@ -566,3 +689,85 @@ class ScriptInterpreter:
             text = text[1:-1]
 
         return text
+
+    # ------------------------------------------------------------------
+    # _eval_test  –  evaluate [ … ] / [[ … ]] / test expressions
+    # ------------------------------------------------------------------
+
+    def _eval_test(self, expr: str) -> bool:
+        """Evaluate a shell test expression. Returns True/False."""
+        expr = expr.strip()
+
+        # Strip outer [ ] or [[ ]]
+        if expr.startswith("[[") and expr.endswith("]]"):
+            expr = expr[2:-2].strip()
+        elif expr.startswith("[") and expr.endswith("]"):
+            expr = expr[1:-1].strip()
+        elif expr.startswith("test "):
+            expr = expr[5:].strip()
+
+        expr = self._expand(expr)
+
+        # Compound: && and ||
+        # Simple left-to-right (no precedence)
+        if " && " in expr:
+            parts = expr.split(" && ", 1)
+            return self._eval_test(parts[0]) and self._eval_test(parts[1])
+        if " || " in expr:
+            parts = expr.split(" || ", 1)
+            return self._eval_test(parts[0]) or self._eval_test(parts[1])
+
+        # Negation
+        if expr.startswith("! "):
+            return not self._eval_test(expr[2:])
+
+        tokens = expr.split()
+
+        # Unary file tests
+        if len(tokens) == 2 and tokens[0] in ("-f", "-d", "-e", "-r", "-w", "-x", "-s", "-z", "-n"):
+            flag, val = tokens[0], tokens[1]
+            if flag == "-z": return len(val) == 0
+            if flag == "-n": return len(val) > 0
+            # For the virtual FS, treat any non-empty string as "exists"
+            if flag in ("-e", "-f", "-d", "-r", "-w", "-x", "-s"):
+                try:
+                    node = self.shell.resolve_path(val)
+                    if flag == "-d": return node.is_dir
+                    if flag == "-f": return not node.is_dir
+                    if flag == "-s": return node.size > 0
+                    return True
+                except Exception:
+                    return False
+
+        # Binary comparisons
+        if len(tokens) >= 3:
+            lhs, op, rhs = tokens[0], tokens[1], " ".join(tokens[2:])
+            if op == "==" or op == "=":  return lhs == rhs
+            if op == "!=":               return lhs != rhs
+            if op == "-eq":
+                try: return int(lhs) == int(rhs)
+                except ValueError: return False
+            if op == "-ne":
+                try: return int(lhs) != int(rhs)
+                except ValueError: return False
+            if op == "-lt":
+                try: return int(lhs) < int(rhs)
+                except ValueError: return False
+            if op == "-le":
+                try: return int(lhs) <= int(rhs)
+                except ValueError: return False
+            if op == "-gt":
+                try: return int(lhs) > int(rhs)
+                except ValueError: return False
+            if op == "-ge":
+                try: return int(lhs) >= int(rhs)
+                except ValueError: return False
+
+        # Plain string / command truthiness
+        if not tokens:
+            return False
+        # single token: truthy if non-empty and not "0" or "false"
+        if len(tokens) == 1:
+            return bool(tokens[0]) and tokens[0] not in ("0", "false", "")
+
+        return False

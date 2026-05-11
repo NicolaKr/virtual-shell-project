@@ -67,6 +67,7 @@ def _semicolon_split(line: str) -> list:
     Strategy: split on ';' but keep the tokens 'do', 'done', 'then',
     'fi', 'elif', 'else' on their own lines so the interpreter's
     line-by-line parser works correctly.
+    Ignores semicolons inside single or double quotes (e.g. awk programs).
     """
     # Simple case: no semicolons
     if ";" not in line:
@@ -74,11 +75,19 @@ def _semicolon_split(line: str) -> list:
 
     parts = []
     depth = 0  # track ( )
+    in_quote = None
     current = ""
     i = 0
     while i < len(line):
         ch = line[i]
-        if ch == "(" :
+        if in_quote:
+            current += ch
+            if ch == in_quote:
+                in_quote = None
+        elif ch in ('"', "'"):
+            in_quote = ch
+            current += ch
+        elif ch == "(" :
             depth += 1
             current += ch
         elif ch == ")":
@@ -119,7 +128,6 @@ class Shell:
         self.env = env
         self._history: list[str] = []
         self.commands: dict[str, Command] = {}
-
         for cmd in [
             # filesystem
             Command("ls",        "ls [-la] [path]",             "list directory contents",          self.ls),
@@ -144,6 +152,7 @@ class Shell:
             Command("tail",      "tail [-n N] <file>",          "print last N lines",               self.tail),
             Command("wc",        "wc [-lwc] <file>",            "word/line/char count",             self.wc),
             Command("sort",      "sort [-r|-n|-u] <file>",      "sort lines of a file",             self.sort),
+            Command("awk",       "awk 'program' [file]",        "pattern-action text processing",   self.awk_cmd),
             Command("uniq",      "uniq [-c] <file>",            "filter/count duplicate lines",     self.uniq),
             Command("cut",       "cut -d <d> -f <n> <file>",   "cut fields from lines",            self.cut),
             Command("tr",        "tr <set1> <set2>",            "translate characters (piped)",     self.tr),
@@ -243,6 +252,52 @@ class Shell:
         if m_sub:
             line = m_sub.group(1).strip()
 
+        # Brace group:  { cmd; cmd; }  or  { cmd; cmd; } > file
+        # Depth-aware so { } inside awk programs are handled correctly.
+        if line.startswith("{"):
+            depth, in_q, close = 0, None, -1
+            for _i, _ch in enumerate(line):
+                if in_q:
+                    if _ch == in_q: in_q = None
+                elif _ch in ('"', "'"):
+                    in_q = _ch
+                elif _ch == "{":
+                    depth += 1
+                elif _ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        close = _i
+                        break
+            if close != -1:
+                inner = line[1:close].strip()
+                rest  = line[close + 1:].strip()
+                m_redir = re.match(r"^(>>?)\s*(\S+)\s*$", rest)
+                op   = m_redir.group(1) if m_redir else None
+                dest = m_redir.group(2) if m_redir else None
+                if op and dest:
+                    buf = io.StringIO()
+                    old_stdout = sys.stdout
+                    sys.stdout = buf
+                    try:
+                        for part in _semicolon_split(inner):
+                            self.run(part.strip())
+                    finally:
+                        sys.stdout = old_stdout
+                    output = buf.getvalue()
+                    try:
+                        node = self._get_or_create_file(dest)
+                        if ">>" in op:
+                            node.content += output
+                        else:
+                            node.content = output
+                        node.touch_mtime()
+                    except Exception as e:
+                        print(f"bash: {e}")
+                else:
+                    for part in _semicolon_split(inner):
+                        self.run(part.strip())
+                return None
+
         # Suppress /dev/null redirections at shell level
         line = re.sub(r"\s+>\s*/dev/null", "", line)
         line = re.sub(r"\s+2>/dev/null",   "", line)
@@ -259,11 +314,36 @@ class Shell:
                 self.run(part.strip())
             return None
 
-        # Pipe:  a | b | c
-        if "|" in line and "||" not in line:
-            segments = line.split("|")
-            output = self._run_single(segments[0].strip(), capture=True) or ""
-            for seg in segments[1:-1]:
+        def _qsplit(s, sep):
+            """Split on sep but ignore occurrences inside single/double quotes.
+            Handles nested quotes: the other quote type inside an active quote
+            is treated as a literal character, not a new quote opener.
+            """
+            parts, buf, i, in_quote = [], [], 0, None
+            slen = len(sep)
+            while i < len(s):
+                ch = s[i]
+                if in_quote:
+                    buf.append(ch)
+                    if ch == in_quote:
+                        in_quote = None
+                    i += 1
+                elif ch in ('"', "'"):
+                    in_quote = ch
+                    buf.append(ch)
+                    i += 1
+                elif s[i:i+slen] == sep:
+                    parts.append("".join(buf)); buf = []; i += slen
+                else:
+                    buf.append(ch); i += 1
+            parts.append("".join(buf))
+            return parts
+
+        # Pipe:  a | b | c  (quote-aware so | inside 'awk program' is safe)
+        pipe_segs = _qsplit(line, "|")
+        if len(pipe_segs) > 1 and "||" not in line:
+            output = self._run_single(pipe_segs[0].strip(), capture=True) or ""
+            for seg in pipe_segs[1:-1]:
                 buf = io.StringIO()
                 old_stdout = sys.stdout
                 sys.stdout = buf
@@ -272,12 +352,13 @@ class Shell:
                 finally:
                     sys.stdout = old_stdout
                 output = buf.getvalue()
-            self._run_piped(segments[-1].strip(), output)
+            self._run_piped(pipe_segs[-1].strip(), output)
             return None
 
-        # Logical AND
-        if "&&" in line:
-            for part in line.split("&&"):
+        # Logical AND (quote-aware so && inside 'awk program' is safe)
+        and_parts = _qsplit(line, "&&")
+        if len(and_parts) > 1:
+            for part in and_parts:
                 self.run(part.strip())
                 if self.env.last_exit_code != 0:
                     break
@@ -383,10 +464,39 @@ class Shell:
     def _run_piped(self, right_cmd: str, stdin_text: str) -> None:
         """Run the right side of a pipe, injecting stdin_text as stdin."""
         right_cmd = self._expand_vars(right_cmd.strip())
+
+        # Handle trailing redirect:  cmd [args] > file  or  >> file
+        redir = re.search(r'\s+(>>|>)\s+(\S+)\s*$', right_cmd)
+        if redir:
+            op, dest = redir.group(1), redir.group(2)
+            right_cmd = right_cmd[:redir.start()]
+            # capture output of the piped command then write to file
+            buf = io.StringIO()
+            old = sys.stdout
+            sys.stdout = buf
+            try:
+                self._run_piped(right_cmd.strip(), stdin_text)
+            finally:
+                sys.stdout = old
+            result = buf.getvalue()
+            try:
+                node = self._get_or_create_file(dest)
+                if op == ">>":
+                    node.content += result
+                else:
+                    node.content = result
+                node.touch_mtime()
+            except Exception as e:
+                print(f"bash: {e}")
+            return
+
         try:
             parts = shlex.split(right_cmd)
         except Exception:
             print("parse error")
+            return
+
+        if not parts:          # empty segment (e.g. trailing pipe with no rhs)
             return
 
         cmd, args = parts[0], parts[1:]
@@ -401,14 +511,29 @@ class Shell:
             invert      = "-v" in flags
             insensitive = "-i" in flags
             show_num    = "-n" in flags
-            for i, ln in enumerate(stdin_text.splitlines(), 1):
+            # -B N  (lines of before-context)
+            before_ctx = 0
+            for fi, fa in enumerate(args):
+                if fa == "-B" and fi + 1 < len(args):
+                    try: before_ctx = int(args[fi + 1])
+                    except ValueError: pass
+                elif re.match(r"^-B(\d+)$", fa):
+                    before_ctx = int(re.match(r"^-B(\d+)$", fa).group(1))
+            all_lines = stdin_text.splitlines()
+            printed   = set()
+            for i, ln in enumerate(all_lines):
                 haystack = ln.lower() if insensitive else ln
                 needle   = pattern.lower() if insensitive else pattern
                 match    = needle in haystack
-                if invert:
-                    match = not match
+                if invert: match = not match
                 if match:
-                    print(f"{i}:{ln}" if show_num else ln)
+                    for bi in range(max(0, i - before_ctx), i):
+                        if bi not in printed:
+                            print(f"{bi+1}:{all_lines[bi]}" if show_num else all_lines[bi])
+                            printed.add(bi)
+                    if i not in printed:
+                        print(f"{i+1}:{ln}" if show_num else ln)
+                        printed.add(i)
         elif cmd == "sort":
             self._pipe_sort(stdin_text, args)
         elif cmd == "uniq":
@@ -440,6 +565,8 @@ class Shell:
             self._pipe_cut(stdin_text, args)
         elif cmd == "cat":
             print(stdin_text, end="")
+        elif cmd == "awk":
+            self._pipe_awk(stdin_text, args)
         elif cmd in self.commands:
             self.commands[cmd].fn(args)
         else:
@@ -455,7 +582,23 @@ class Shell:
         reverse = "r" in flags
         numeric = "n" in flags
         unique  = "u" in flags
-        key_fn  = (lambda x: int(x) if x.isdigit() else 0) if numeric else str
+        version = "V" in flags  # version/IP sort: split on dots and compare numerically
+
+        def ip_key(s):
+            """Sort IPs/version strings numerically per segment."""
+            try:
+                return [int(x) for x in re.split(r'[.\-]', s)]
+            except ValueError:
+                return [s]
+
+        if version:
+            key_fn = ip_key
+        elif numeric:
+            key_fn = lambda x: int(x) if x.strip().lstrip('-').isdigit() else 0
+        else:
+            key_fn = str
+
+        lines.sort(key=key_fn, reverse=reverse)
         if unique:
             seen, deduped = set(), []
             for ln in lines:
@@ -463,8 +606,131 @@ class Shell:
                     seen.add(ln)
                     deduped.append(ln)
             lines = deduped
-        lines.sort(key=key_fn, reverse=reverse)
         print("\n".join(lines))
+
+    def _pipe_awk(self, text: str, args: list) -> None:
+        """Minimal awk: supports /regex/ blocks, field vars ($1..$NF, $0), gsub(), print."""
+        import re as _re
+
+        # Collect the program string and strip surrounding quotes
+        program = " ".join(args).strip()
+        if (program.startswith("'") and program.endswith("'")) or \
+           (program.startswith('"') and program.endswith('"')):
+            program = program[1:-1]
+
+        # Parse rules: each rule is  (pattern, action)
+        # Patterns can be:  /regex/  or  expression (e.g. "auth && ip")
+        # Actions are the { ... } block
+        rules = []
+        i = 0
+        src = program
+        while src:
+            src = src.strip()
+            if not src:
+                break
+            # /regex/ pattern
+            m = _re.match(r'^/([^/]+)/\s*\{([^}]*)\}', src)
+            if m:
+                rules.append(('regex', m.group(1), m.group(2).strip()))
+                src = src[m.end():]
+                continue
+            # bare expression pattern { action }
+            m = _re.match(r'^([^{/][^{]*?)\s*\{([^}]*)\}', src)
+            if m:
+                rules.append(('expr', m.group(1).strip(), m.group(2).strip()))
+                src = src[m.end():]
+                continue
+            # { action } with no pattern = always runs
+            m = _re.match(r'^\{([^}]*)\}', src)
+            if m:
+                rules.append(('always', None, m.group(1).strip()))
+                src = src[m.end():]
+                continue
+            break
+
+        awk_vars = {}  # user variables like ip, auth
+
+        def do_gsub(action_vars, stmt):
+            # gsub(/pat/, "repl", var)
+            m = _re.match(r'gsub\(\s*/([^/]+)/\s*,\s*"([^"]*)"\s*,\s*(\S+?)\s*\)', stmt)
+            if not m:
+                return
+            pat, repl, varname = m.group(1), m.group(2), m.group(3)
+            val = action_vars.get(varname, awk_vars.get(varname, ""))
+            val = _re.sub(pat, repl, val)
+            action_vars[varname] = val  # always write back to local scope
+
+        def resolve(token, fields, action_vars):
+            token = token.strip()
+            if token == "$0":
+                return " ".join(fields)
+            if token == "$NF":
+                return fields[-1] if fields else ""
+            m = _re.match(r'^\$(\d+)$', token)
+            if m:
+                idx = int(m.group(1))
+                return fields[idx - 1] if 0 < idx <= len(fields) else ""
+            if token in action_vars:
+                return action_vars[token]
+            if token in awk_vars:
+                return awk_vars[token]
+            # string literal
+            if (token.startswith('"') and token.endswith('"')) or \
+               (token.startswith("'") and token.endswith("'")):
+                return token[1:-1]
+            return token
+
+        def eval_expr(expr, fields, action_vars):
+            """Evaluate a simple boolean expression for pattern matching."""
+            expr = expr.strip()
+            # truthy variable check:  auth && ip
+            if "&&" in expr:
+                parts = expr.split("&&")
+                return all(eval_expr(p, fields, action_vars) for p in parts)
+            if "||" in expr:
+                parts = expr.split("||")
+                return any(eval_expr(p, fields, action_vars) for p in parts)
+            val = resolve(expr, fields, action_vars)
+            return bool(val) and val != "0"
+
+        def run_action(action, fields, action_vars):
+            for stmt in _re.split(r'[;\n]+', action):
+                stmt = stmt.strip()
+                if not stmt:
+                    continue
+                if stmt.startswith("gsub("):
+                    do_gsub(action_vars, stmt)
+                elif stmt.startswith("print ") or stmt == "print":
+                    arg = stmt[6:].strip() if stmt != "print" else "$0"
+                    # handle print with multiple comma-separated tokens
+                    tokens = [t.strip() for t in arg.split(",")] if arg else ["$0"]
+                    print(" ".join(resolve(t, fields, action_vars) for t in tokens))
+                elif "=" in stmt and not stmt.startswith("if"):
+                    # variable assignment:  varname = value  OR  varname=value
+                    lhs, _, rhs = stmt.partition("=")
+                    lhs = lhs.strip()
+                    if _re.match(r'^[A-Za-z_]\w*$', lhs):
+                        # write into action_vars (local_vars) so later stmts on
+                        # this line see the updated value immediately
+                        action_vars[lhs] = resolve(rhs.strip(), fields, action_vars)
+
+        for line in text.splitlines():
+            fields = line.split()
+            local_vars = dict(awk_vars)  # snapshot for this line
+
+            for rule in rules:
+                kind = rule[0]
+                if kind == 'regex':
+                    if _re.search(rule[1], line):
+                        run_action(rule[2], fields, local_vars)
+                elif kind == 'expr':
+                    if eval_expr(rule[1], fields, local_vars):
+                        run_action(rule[2], fields, local_vars)
+                elif kind == 'always':
+                    run_action(rule[2], fields, local_vars)
+
+            # write back any variables the action may have set
+            awk_vars.update(local_vars)
 
     def _pipe_uniq(self, text: str, args: list) -> None:
         count  = "-c" in args
@@ -480,6 +746,27 @@ class Shell:
         print("\n".join(result))
 
     def _pipe_tr(self, text: str, args: list) -> None:
+        def expand_range(s: str) -> str:
+            result, i = "", 0
+            s = s.strip("'\"")
+            while i < len(s):
+                if i + 2 < len(s) and s[i + 1] == "-":
+                    result += "".join(chr(c) for c in range(ord(s[i]), ord(s[i + 2]) + 1))
+                    i += 3
+                else:
+                    result += s[i]
+                    i += 1
+            return result
+
+        # tr -d <set>  — delete all characters in set
+        if args and args[0] == "-d":
+            if len(args) < 2:
+                print(text, end="")
+                return
+            table = str.maketrans("", "", expand_range(args[1]))
+            print(text.translate(table), end="")
+            return
+
         if len(args) < 2:
             print(text, end="")
             return
@@ -536,36 +823,47 @@ class Shell:
     # =========================================================
 
     def _expand_vars(self, text: str) -> str:
-        # Brace expansion  {N..M}  →  space-separated list
-        text = re.sub(
-            r"\{(\d+)\.\.(\d+)\}",
-            lambda m: " ".join(str(x) for x in _brace_range(int(m.group(1)), int(m.group(2)))),
-            text,
-        )
-        text = re.sub(r"\$\?", str(self.env.last_exit_code), text)
-        text = re.sub(
-            r"\$\{(\w+):-([^}]*)\}",
-            lambda m: self.env.vars.get(m.group(1), m.group(2)),
-            text,
-        )
-        text = re.sub(
-            r"\$\{(\w+)\}",
-            lambda m: self.env.vars.get(m.group(1), ""),
-            text,
-        )
-        for k, v in sorted(self.env.vars.items(), key=lambda x: -len(x[0])):
-            text = re.sub(rf"\${k}\b", v, text)
-        text = re.sub(
-            r"\$\(\(\s*(.*?)\s*\)\)",
-            lambda m: str(self._eval_arith(m.group(1))),
-            text,
-        )
-        text = re.sub(
-            r"\$\(([^)]+)\)",
-            lambda m: (self._run_single(m.group(1).strip(), capture=True) or "").strip(),
-            text,
-        )
-        return text
+        """Expand shell variables, skipping content inside single quotes."""
+        # Split on single-quoted regions; only expand outside them.
+        # e.g.  echo "hello $NAME 'keep $NF as-is' done"
+        parts = text.split("'")
+        expanded = []
+        for i, part in enumerate(parts):
+            if i % 2 == 1:
+                # inside single quotes — never expand, just restore quotes
+                expanded.append("'" + part + "'")
+            else:
+                # outside single quotes — expand as normal
+                part = re.sub(
+                    r"\{(\d+)\.\.(\d+)\}",
+                    lambda m: " ".join(str(x) for x in _brace_range(int(m.group(1)), int(m.group(2)))),
+                    part,
+                )
+                part = re.sub(r"\$\?", str(self.env.last_exit_code), part)
+                part = re.sub(
+                    r"\$\{(\w+):-([^}]*)\}",
+                    lambda m: self.env.vars.get(m.group(1), m.group(2)),
+                    part,
+                )
+                part = re.sub(
+                    r"\$\{(\w+)\}",
+                    lambda m: self.env.vars.get(m.group(1), ""),
+                    part,
+                )
+                for k, v in sorted(self.env.vars.items(), key=lambda x: -len(x[0])):
+                    part = re.sub(rf"\${k}\b", v, part)
+                part = re.sub(
+                    r"\$\(\(\s*(.*?)\s*\)\)",
+                    lambda m: str(self._eval_arith(m.group(1))),
+                    part,
+                )
+                part = re.sub(
+                    r"\$\(([^)]+)\)",
+                    lambda m: (self._run_single(m.group(1).strip(), capture=True) or "").strip(),
+                    part,
+                )
+                expanded.append(part)
+        return "".join(expanded)
 
     def _eval_arith(self, expr: str) -> int:
         local = {}
@@ -1089,6 +1387,21 @@ class Shell:
         if node.is_dir:
             print("sort: Is a directory"); return
         self._pipe_sort(node.content, flags)
+
+    def awk_cmd(self, args: list) -> None:
+        """Standalone awk: awk 'program' [file]"""
+        if not args:
+            print("usage: awk 'program' [file]")
+            return
+        program = args[0]
+        if len(args) > 1:
+            try:
+                node = self.resolve_path(args[1])
+                self._pipe_awk(node.content, [program])
+            except FileNotFoundError as e:
+                print(f"awk: {e}")
+        else:
+            print("awk: no input (use in a pipe)")
 
     def uniq(self, args: list) -> None:
         targets = [a for a in args if not a.startswith("-")]
@@ -2108,343 +2421,21 @@ class Shell:
         ScriptInterpreter(self).run_lines(lines)
 
     # =========================================================
-    # HELP / MAN
+    # HELP / MAN  –  content and rendering live in helper.py
     # =========================================================
 
-    HELP_DETAIL = {
-        "ls": {
-            "desc": "List directory contents.",
-            "flags": [
-                ("-l",  "long format: permissions, owner, size, mtime"),
-                ("-a",  "show hidden files (names starting with .)"),
-                ("-la", "combine long format and hidden files"),
-            ],
-            "examples": [
-                ("ls",          "list current directory"),
-                ("ls -l",       "long listing with permissions and sizes"),
-                ("ls -la /etc", "long + hidden files in /etc"),
-            ],
-            "tip": "Directories are shown with a trailing /.  Use 'cd <dir>' to enter one.",
-        },
-        "cd": {
-            "desc": "Change the current working directory.",
-            "flags": [],
-            "examples": [
-                ("cd /etc", "go to /etc"),
-                ("cd ..",   "go up one level"),
-                ("cd ~",    "go to home directory"),
-                ("cd -",    "go to previous directory (uses $OLDPWD)"),
-            ],
-            "tip": "After cd, run 'pwd' to confirm your new location.",
-        },
-        "cat": {
-            "desc": "Print the contents of one or more files to the screen.",
-            "flags": [],
-            "examples": [
-                ("cat file.txt",           "print file.txt"),
-                ("cat /etc/passwd",        "print the system password file"),
-                ("cat file1.txt file2.txt","print two files one after the other"),
-            ],
-            "tip": "For long files use 'head', 'tail', or pipe through 'less'.",
-        },
-        "echo": {
-            "desc": "Print text to the screen. Variables are expanded automatically.",
-            "flags": [("-n", "omit the trailing newline")],
-            "examples": [
-                ("echo hello world",    "print 'hello world'"),
-                ("echo $HOME",          "print the value of the HOME variable"),
-                ("echo hey > file.txt", "write 'hey' into file.txt (redirection)"),
-            ],
-            "tip": "Combine with > or >> to write text into files.",
-        },
-        "grep": {
-            "desc": "Search for lines matching a pattern inside files (or piped input).",
-            "flags": [
-                ("-n", "show line numbers"),
-                ("-i", "case-insensitive match"),
-                ("-v", "invert: show lines that do NOT match"),
-                ("-r", "recursive: search all files under a directory"),
-                ("-c", "count matching lines instead of printing them"),
-            ],
-            "examples": [
-                ("grep root /etc/passwd",         "find lines containing 'root'"),
-                ("grep -n error /var/log/syslog", "show line numbers for 'error'"),
-                ("cat file.txt | grep foo",       "search piped input"),
-            ],
-            "tip": "Chain with pipes: ls | grep .txt",
-        },
-        "find": {
-            "desc": "Search for files and directories by name or type.",
-            "flags": [
-                ("-name <pat>", "match filename with glob pattern (* and ?)"),
-                ("-type f",     "match only regular files"),
-                ("-type d",     "match only directories"),
-            ],
-            "examples": [
-                ("find /home -name '*.txt'", "find all .txt files under /home"),
-                ("find . -type d",           "find all directories below current dir"),
-            ],
-            "tip": "Combine -name and -type for precise searches.",
-        },
-        "ping": {
-            "desc": "Check if a remote host is reachable and measure latency.",
-            "flags": [("-c N", "send only N packets (default 4)")],
-            "examples": [
-                ("ping 192.168.0.1",       "ping the gateway"),
-                ("ping -c 2 192.168.0.10", "send only 2 packets"),
-            ],
-            "tip": "Low rtt = fast link. High rtt = slow or distant host.\nUse nmap instead of ping when you want to discover ALL hosts at once.",
-        },
-        "nmap": {
-            "desc": (
-                "Scan the network and discover hosts, open ports, and running services.\n"
-                "nmap (Network Mapper) is a standard security tool used to explore networks.\n"
-                "Think of it like a sonar ping sent to every machine on the network –\n"
-                "each one that answers tells you it exists and what doors (ports) are open."
-            ),
-            "flags": [
-                ("-sV",        "detect service versions on open ports"),
-                ("-sn / -sP",  "ping scan only – discover hosts without port scanning"),
-                ("-A",         "aggressive scan: OS detection + version info"),
-                ("-v",         "verbose: print extra detail while scanning"),
-                ("<prefix>",   "only show hosts whose IP starts with <prefix>"),
-            ],
-            "examples": [
-                ("nmap",                   "scan entire 192.168.0.0/24 network"),
-                ("nmap 192.168.0.",        "same, but filter to that prefix"),
-                ("nmap -sV",               "also show service version strings"),
-                ("nmap -sn",               "quick ping sweep – no port info"),
-            ],
-            "tip": (
-                "Read the output carefully:\n"
-                "  PORT       – the door number (22=SSH, 80=web, 3306=database …)\n"
-                "  STATE open – the service is running and accepting connections\n"
-                "  OS         – the operating system guess\n"
-                "  Auth       – whether a password is needed to log in\n"
-                "Once you spot an open SSH port, try: ssh <ip>"
-            ),
-        },
-        "ssh": {
-            "desc": (
-                "Open a secure shell session on a remote host (SSH = Secure SHell).\n"
-                "SSH lets you log into another computer over the network and run\n"
-                "commands on it as if you were sitting in front of it."
-            ),
-            "flags": [
-                ("-p <port>",   "connect on a non-standard port (default is 22)"),
-                ("-l <user>",   "log in as a different username"),
-            ],
-            "examples": [
-                ("ssh 192.168.0.42",           "connect to that IP (public host, no password)"),
-                ("ssh 192.168.0.77",           "connect – will prompt for a password if required"),
-                ("ssh -l admin 192.168.0.77",  "log in as user 'admin'"),
-                ("ssh -p 2222 192.168.0.77",   "connect on port 2222 instead of 22"),
-            ],
-            "tip": (
-                "Workflow:\n"
-                "  1. Run nmap to find hosts and see which have port 22 open\n"
-                "  2. ssh <ip> to connect\n"
-                "  3. If asked for a password, check scan output for hints\n"
-                "  4. Once inside, explore with ls, cat, find – look for hidden files!\n"
-                "  Type 'exit' or press Ctrl+D to disconnect and return home."
-            ),
-        },
-        "nano": {
-            "desc": "Open the interactive text editor.",
-            "flags": [],
-            "examples": [
-                ("nano file.txt",        "open or create file.txt for editing"),
-                ("nano scripts/sweep.sh", "edit a script"),
-            ],
-            "tip": (
-                "Controls inside nano:\n"
-                "  Arrow keys   – move cursor\n"
-                "  Ctrl+S       – save\n"
-                "  Ctrl+Q / Ctrl+X – quit\n"
-                "  Ctrl+K       – cut current line\n"
-                "  Ctrl+U       – paste cut line\n"
-                "  Ctrl+G       – show help inside nano"
-            ),
-        },
-        "run": {
-            "desc": "Execute a shell script file. The file must have execute permission (chmod +x).\nYou can also run scripts with ./script.sh – the ./ means 'in this directory'.",
-            "flags": [],
-            "examples": [
-                ("run myscript.sh",         "run a script in the current directory"),
-                ("./myscript.sh",           "same thing using the direct path syntax"),
-                ("run script.sh arg1 arg2", "pass arguments accessible as $1 $2"),
-            ],
-            "tip": "Don't forget: chmod +x script.sh before running it!",
-        },
-        "chmod": {
-            "desc": "Change file permissions (who can read/write/execute a file).",
-            "flags": [],
-            "examples": [
-                ("chmod +x script.sh",  "make script.sh executable"),
-                ("chmod 755 script.sh", "rwx for owner, rx for group+others"),
-                ("chmod 644 file.txt",  "rw for owner, r for group+others"),
-            ],
-            "tip": "Scripts must have +x before you can execute them (e.g. ./script.sh).",
-        },
-        "export": {
-            "desc": "Set or display environment variables available to all commands.",
-            "flags": [],
-            "examples": [
-                ("export",                    "list all current environment variables"),
-                ("export TARGET=192.168.0.25","set TARGET variable"),
-            ],
-            "tip": "Variables set with 'export' persist for the whole session.",
-        },
-        "history": {
-            "desc": "Show a numbered list of previously entered commands.",
-            "flags": [],
-            "examples": [
-                ("history",    "show all history"),
-                ("history 10", "show last 10 commands"),
-            ],
-            "tip": "Press the UP arrow key to navigate through history interactively.",
-        },
-        "alias": {
-            "desc": "Create a shortcut name for a longer command.",
-            "flags": [],
-            "examples": [
-                ("alias",            "list all currently defined aliases"),
-                ("alias ll='ls -la'","create alias ll for ls -la"),
-            ],
-            "tip": "Aliases only last for this session.",
-        },
-        "source": {
-            "desc": "Run a script file in the current shell. Variables set inside the script remain available.",
-            "flags": [],
-            "examples": [("source setup.sh", "run setup.sh and keep its variables")],
-            "tip": "Unlike 'run', source shares the current shell's variables with the script.",
-        },
-        "curl": {
-            "desc": "Transfer data from a URL (like a web browser in the terminal).",
-            "flags": [
-                ("-s",        "silent: suppress progress output"),
-                ("-o <file>", "save response to a file instead of printing it"),
-            ],
-            "examples": [
-                ("curl http://192.168.0.10",              "fetch the web server homepage"),
-                ("curl -o page.html http://192.168.0.10", "save page to file"),
-            ],
-            "tip": "curl is great for exploring web services and APIs from the terminal.",
-        },
-        "ps": {
-            "desc": "Show a list of running processes.",
-            "flags": [("-aux", "show all processes from all users")],
-            "examples": [("ps", "show processes"), ("ps -aux", "show all processes")],
-            "tip": "Note the PID column – you need the PID to kill a process.",
-        },
-        "kill": {
-            "desc": "Terminate a running process by its PID.",
-            "flags": [("-9", "SIGKILL – force kill, cannot be caught by the process")],
-            "examples": [
-                ("kill 1001",    "send SIGTERM to process 1001"),
-                ("kill -9 1001", "force kill process 1001"),
-            ],
-            "tip": "Use ps first to find the PID of the process you want to stop.",
-        },
-        "diff": {
-            "desc": "Compare two files line by line and show the differences.",
-            "flags": [],
-            "examples": [("diff file1.txt file2.txt", "show differences between two files")],
-            "tip": "Lines starting with < are from file1, > are from file2.",
-        },
-        "man": {
-            "desc": "Display the manual page for a command.",
-            "flags": [],
-            "examples": [("man ls", "manual for ls"), ("man grep", "manual for grep")],
-            "tip": "You can also use 'help <command>' for a shorter quick reference.",
-        },
-    }
+    try:
+        from helper import HELP_DETAIL
+    except ImportError:
+        HELP_DETAIL: dict = {}
 
     def help(self, args: list = None) -> None:
-        if args:
-            cmd_name = args[0]
-            if cmd_name in self.HELP_DETAIL:
-                detail = self.HELP_DETAIL[cmd_name]
-                usage  = self.commands[cmd_name].usage if cmd_name in self.commands else cmd_name
-                print(f"\n  ╔══ {cmd_name} ══")
-                print(f"  ║  {detail['desc']}")
-                print(f"  ║")
-                print(f"  ║  USAGE:  {usage}")
-                if detail["flags"]:
-                    print(f"  ║\n  ║  FLAGS:")
-                    for flag, fdesc in detail["flags"]:
-                        print(f"  ║    {flag:<16}  {fdesc}")
-                if detail["examples"]:
-                    print(f"  ║\n  ║  EXAMPLES:")
-                    for ex_cmd, ex_desc in detail["examples"]:
-                        print(f"  ║    $ {ex_cmd}")
-                        print(f"  ║      → {ex_desc}")
-                if detail.get("tip"):
-                    lines = detail["tip"].splitlines()
-                    print(f"  ║")
-                    for i, ln in enumerate(lines):
-                        print(f"  ║  {'TIP: ' if i == 0 else '      '}{ln}")
-                print(f"  ╚{'═' * 50}\n")
-            elif cmd_name in self.commands:
-                cmd = self.commands[cmd_name]
-                print(f"\n  {cmd.usage}\n  {cmd.description}\n")
-            else:
-                print(f"  No help available for '{cmd_name}'")
-        else:
-            print("\n  Cyber Shell Lab — Command Reference")
-            print("  " + "─" * 50)
-            print("  Tip: type  help <command>  for detailed help with examples\n")
-            groups = {
-                "File System":  ["ls", "cd", "pwd", "cat", "nano", "mkdir", "touch", "rm", "cp", "mv",
-                                  "grep", "find", "head", "tail", "wc", "sort", "uniq", "cut", "diff",
-                                  "chmod", "chown", "stat", "du", "df", "file"],
-                "Text & Shell": ["echo", "printf", "export", "unset", "read", "alias", "type",
-                                  "which", "whoami", "id", "hostname", "uname", "uptime", "date",
-                                  "history", "sleep", "true", "false", "test", "env", "printenv", "xargs"],
-                "Process":      ["ps", "kill", "jobs"],
-                "Network":      ["ping", "nmap", "ssh", "ifconfig", "ip", "netstat",
-                                  "curl", "wget", "traceroute", "nslookup"],
-                "Scripting":    ["run", "source", "help", "man", "clear", "exit"],
-            }
-            for group, names in groups.items():
-                print(f"  {group}:")
-                for n in names:
-                    if n in self.commands:
-                        cmd    = self.commands[n]
-                        marker = "✦" if n in self.HELP_DETAIL else " "
-                        print(f"    {marker} {cmd.usage:<38} {cmd.description}")
-                print()
-            print("  ✦ = detailed help available  (try: help grep)")
+        from commands.helper import render_help
+        render_help(self, args)
 
     def man_cmd(self, args: list) -> None:
-        if not args:
-            print("What manual page do you want?"); return
-        cmd_name = args[0]
-        if cmd_name not in self.commands:
-            print(f"No manual entry for {cmd_name}")
-            self.env.last_exit_code = 1
-            return
-        cmd = self.commands[cmd_name]
-        print(f"\nNAME\n       {cmd_name} — {cmd.description}")
-        print(f"\nSYNOPSIS\n       {cmd.usage}")
-        if cmd_name in self.HELP_DETAIL:
-            d = self.HELP_DETAIL[cmd_name]
-            print(f"\nDESCRIPTION\n       {d['desc']}")
-            if d["flags"]:
-                print("\nOPTIONS")
-                for flag, fdesc in d["flags"]:
-                    print(f"       {flag:<16}  {fdesc}")
-            if d["examples"]:
-                print("\nEXAMPLES")
-                for ex_cmd, ex_desc in d["examples"]:
-                    print(f"       $ {ex_cmd}\n         {ex_desc}")
-            if d.get("tip"):
-                print("\nNOTES")
-                for ln in d["tip"].splitlines():
-                    print(f"       {ln}")
-        else:
-            print(f"\nDESCRIPTION\n       {cmd.description}.")
-        print()
+        from commands.helper import render_man
+        render_man(self, args)
 
 
 # ===========================================================================

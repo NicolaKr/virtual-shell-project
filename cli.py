@@ -165,6 +165,13 @@ def main(
             prompt = f"{env.user}@{env.hostname}:{path}$ "
             try:
                 line = input(prompt)
+                # Backslash line continuation
+                while line.endswith("\\"):
+                    line = line[:-1]
+                    try:
+                        line += input("> ")
+                    except (EOFError, KeyboardInterrupt):
+                        break
             except EOFError:
                 print("\nlogout")
                 break
