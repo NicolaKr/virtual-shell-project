@@ -43,6 +43,7 @@ def run_connect(shell, args: list, commands: list = None) -> None:
     req_user  = None
     i = 0
     auto_yes = False
+    quiet    = False
     while i < len(args):
         if args[i] == "-p" and i + 1 < len(args):
             try:
@@ -55,6 +56,9 @@ def run_connect(shell, args: list, commands: list = None) -> None:
             i += 2
         elif args[i] == "-y":
             auto_yes = True
+            i += 1
+        elif args[i] == "-q":
+            quiet = True
             i += 1
         elif not args[i].startswith("-"):
             ip = args[i]
@@ -81,25 +85,28 @@ def run_connect(shell, args: list, commands: list = None) -> None:
     is_public  = host.get("public", True)
 
     # --- SSH handshake lines ---
-    print(f"SSH client version: OpenSSH_9.6p1 Ubuntu-3ubuntu13, OpenSSL 3.0.13 4 Feb 2024")
-    time.sleep(0.05)
-    print(f"debug1: Connecting to {ip} [{ip}] port {port}.")
-    time.sleep(random.uniform(0.05, 0.15))
-    print(f"debug1: Connection established.")
-    time.sleep(0.04)
-    print(f"debug1: identity file /home/student/.ssh/id_ed25519 type -1")
-    print(f"debug1: Local version string SSH-2.0-OpenSSH_9.6p1")
-    print(f"debug1: Remote protocol version 2.0, remote software version {ssh_ver.replace('SSH-2.0-','')}")
-    time.sleep(0.06)
-    print(f"debug1: kex: algorithm: curve25519-sha256")
-    print(f"debug1: kex: host key algorithm: ecdsa-sha2-nistp256")
+    if not quiet:
+        print(f"SSH client version: OpenSSH_9.6p1 Ubuntu-3ubuntu13, OpenSSL 3.0.13 4 Feb 2024")
+        time.sleep(0.05)
+        print(f"debug1: Connecting to {ip} [{ip}] port {port}.")
+        time.sleep(random.uniform(0.05, 0.15))
+        print(f"debug1: Connection established.")
+        time.sleep(0.04)
+        print(f"debug1: identity file /home/student/.ssh/id_ed25519 type -1")
+        print(f"debug1: Local version string SSH-2.0-OpenSSH_9.6p1")
+        print(f"debug1: Remote protocol version 2.0, remote software version {ssh_ver.replace('SSH-2.0-','')}")
+        time.sleep(0.06)
+        print(f"debug1: kex: algorithm: curve25519-sha256")
+        print(f"debug1: kex: host key algorithm: ecdsa-sha2-nistp256")
     fp = _fake_ed25519()
-    print(f"debug1: Server host key: ecdsa-sha2-nistp256 {fp}")
+    if not quiet:
+        print(f"debug1: Server host key: ecdsa-sha2-nistp256 {fp}")
 
-    # First-time host key warning — skipped with -y or when scripted
+    # First-time host key warning — skipped with -y/-q or when scripted
     if ip not in shell.env.authenticated:
         if auto_yes or commands is not None:
-            print(f"Warning: Permanently added '{ip}' (ECDSA) to the list of known hosts.")
+            if not quiet:
+                print(f"Warning: Permanently added '{ip}' (ECDSA) to the list of known hosts.")
         else:
             print(f"The authenticity of host '{ip} ({ip})' can't be established.")
             print(f"ECDSA key fingerprint is {fp}.")
@@ -119,19 +126,21 @@ def run_connect(shell, args: list, commands: list = None) -> None:
     authenticated = False
 
     if is_public:
-        print(f"debug1: Authenticating to {ip}:{port} as '{auth_user}'")
-        time.sleep(0.04)
-        print(f"debug1: Trying private key: /home/student/.ssh/id_ed25519")
-        time.sleep(0.06)
-        print(f"debug1: Authentication succeeded (publickey).")
+        if not quiet:
+            print(f"debug1: Authenticating to {ip}:{port} as '{auth_user}'")
+            time.sleep(0.04)
+            print(f"debug1: Trying private key: /home/student/.ssh/id_ed25519")
+            time.sleep(0.06)
+            print(f"debug1: Authentication succeeded (publickey).")
         authenticated = True
 
     elif ip in shell.env.authenticated:
-        print(f"debug1: Authenticating to {ip}:{port} as '{auth_user}'")
-        time.sleep(0.04)
-        print(f"debug1: Trying private key: /home/student/.ssh/id_ed25519")
-        time.sleep(0.06)
-        print(f"debug1: Authentication succeeded (cached credentials).")
+        if not quiet:
+            print(f"debug1: Authenticating to {ip}:{port} as '{auth_user}'")
+            time.sleep(0.04)
+            print(f"debug1: Trying private key: /home/student/.ssh/id_ed25519")
+            time.sleep(0.06)
+            print(f"debug1: Authentication succeeded (cached credentials).")
         authenticated = True
 
     else:
@@ -206,15 +215,15 @@ def run_connect(shell, args: list, commands: list = None) -> None:
 
     # --- Print MOTD ---
     time.sleep(0.1)
-    print()
-    banner = host.get("banner", "")
-    if banner:
-        for line in banner.splitlines():
-            print(line)
+    if not quiet:
         print()
-
-    print(f"--- Connected to {name} ({ip}). Type 'exit' or Ctrl+D to disconnect ---")
-    print()
+        banner = host.get("banner", "")
+        if banner:
+            for line in banner.splitlines():
+                print(line)
+            print()
+        print(f"--- Connected to {name} ({ip}). Type 'exit' or Ctrl+D to disconnect ---")
+        print()
 
     # --- Non-interactive (scripted) mode ---
     if commands is not None:
@@ -268,7 +277,9 @@ def run_connect(shell, args: list, commands: list = None) -> None:
 
     # Connection close
     time.sleep(0.04)
-    print(f"debug1: client_loop: send disconnect: Disconnected from user {auth_user} {ip} port {port}")
+    if not quiet:
+        print(f"debug1: client_loop: send disconnect: Disconnected from user {auth_user} {ip} port {port}")
+        pass
 
     if _RL_AVAILABLE and old_completer is not None:
         try:
@@ -288,12 +299,15 @@ HELP = {
         "flags": [
             ("-p <port>", "connect on a non-standard port (default is 22)"),
             ("-l <user>", "log in as a different username"),
+            ("-y",        "auto-accept host key (skip fingerprint prompt)"),
+            ("-q",        "quiet mode: suppress all debug/banner output (implies -y)"),
         ],
         "examples": [
-            ("ssh 192.168.0.42",          "connect to a public host (no password)"),
-            ("ssh 192.168.0.77",          "connect – will prompt for password if required"),
-            ("ssh -l admin 192.168.0.77", "log in as user 'admin'"),
-            ("ssh -p 2222 192.168.0.77",  "connect on port 2222 instead of 22"),
+            ("ssh 192.168.0.42",                     "connect to a public host (no password)"),
+            ("ssh 192.168.0.77",                     "connect – will prompt for password if required"),
+            ("ssh -l admin 192.168.0.77",            "log in as user 'admin'"),
+            ("ssh -p 2222 192.168.0.77",             "connect on port 2222 instead of 22"),
+            ("ssh -q 192.168.0.42 'cat readme.md'",  "quietly run a command and get only its output"),
         ],
         "tip": (
             "Workflow:\n"

@@ -81,7 +81,27 @@ class ScriptInterpreter:
             pipe_joined.append(pipe_pending)
         lines = pipe_joined
 
-        # Pre-pass: expand one-liner compound commands into multi-line form.
+        # Pre-pass A: join a bare "then" or "do" onto the preceding keyword line.
+        # Handles two cases:
+        #   1. User wrote:   if [[ ... ]];        2. User wrote:  if [[ ... ]]; then
+        #                    then                  (after ; split → bare "then" token)
+        # Both produce a standalone "then" that must be folded back.
+        _then_joined: list[str] = []
+        _ti = 0
+        while _ti < len(lines):
+            _cur = lines[_ti]
+            _nxt = lines[_ti + 1].strip() if _ti + 1 < len(lines) else ""
+            if (_nxt in ("then", "do") and
+                    re.match(r"^(if|elif|while|until|for)", _cur.strip())):
+                # strip trailing semicolons before appending "; then/do"
+                _cur = _cur.rstrip().rstrip(";").rstrip() + "; " + _nxt
+                _ti += 2
+            else:
+                _ti += 1
+            _then_joined.append(_cur)
+        lines = _then_joined
+
+        # Pre-pass B: expand one-liner compound commands into multi-line form.
         # e.g. "for i in a b; do echo $i; done"
         #   -> ["for i in a b", "do", "echo $i", "done"]
         lines = self._expand_one_liners(lines)
@@ -190,8 +210,8 @@ class ScriptInterpreter:
                 return val
 
             # normal line
-            # ssh from a script: pass remaining lines as non-interactive commands
-            if re.match(r'^ssh', line):
+            # ssh from a script — connect interactively, then continue locally
+            if re.match(r'^ssh', line):
                 import shlex as _shlex
                 expanded = self._expand(line)
                 try:
@@ -199,12 +219,14 @@ class ScriptInterpreter:
                 except Exception:
                     parts = expanded.split()
                 remaining = [l.strip() for l in lines[idx+1:] if l.strip()]
+                print("remaining:", remaining)
                 from commands.connect import run_connect
                 run_connect(self.shell, parts[1:], commands=remaining)
                 return self._return_value or 0
-            self._run_line(line)
-            if self._return_value is not None:
-                return self._return_value
+            else:
+                self._run_line(line)
+                if self._return_value is not None:
+                    return self._return_value
             idx += 1
 
         return self._return_value or 0
@@ -293,7 +315,19 @@ class ScriptInterpreter:
         # body lines are kept as separate lines; "done"/"fi" close.
         expanded = []
         for part in parts:
-            # "do cmd" → "do" + "  cmd" (if body mixed in)
+            # bare "then" → fold onto preceding if/elif line
+            if part.strip() == "then":
+                if expanded and re.match(r'^(if|elif)', expanded[-1].strip()):
+                    expanded[-1] = expanded[-1].rstrip().rstrip(";").rstrip() + "; then"
+                continue
+
+            # bare "do" → fold onto preceding while/for/until line
+            if part.strip() == "do":
+                if expanded and re.match(r'^(while|until|for)', expanded[-1].strip()):
+                    expanded[-1] = expanded[-1].rstrip().rstrip(";").rstrip() + "; do"
+                continue
+
+            # "do cmd" → keep "do" inline, add body lines
             m_do = re.match(r'^do\s+(.+)$', part)
             if m_do:
                 expanded.append("do")
@@ -305,16 +339,22 @@ class ScriptInterpreter:
                     elif bp == "done":
                         expanded.append("done")
                 continue
+
+            # "then cmd" → fold then onto preceding if/elif, add body lines
             m_then = re.match(r'^then\s+(.+)$', part)
             if m_then:
-                expanded.append("then")
+                if expanded and re.match(r'^(if|elif)', expanded[-1].strip()):
+                    expanded[-1] = expanded[-1].rstrip().rstrip(";").rstrip() + "; then"
+                else:
+                    expanded.append("then")
                 for bp in m_then.group(1).split(";"):
                     bp = bp.strip()
-                    if bp and bp not in ("fi","else"):
+                    if bp and bp not in ("fi", "else"):
                         expanded.append("  " + bp)
-                    elif bp in ("fi","else"):
+                    elif bp in ("fi", "else"):
                         expanded.append(bp)
                 continue
+
             expanded.append(part)
 
         return expanded
@@ -395,6 +435,7 @@ class ScriptInterpreter:
                 continue
             # header like 'if test ...' or 'elif test ...'
             condition = header.split(None, 1)[1] if " " in header else ""
+            condition = re.sub(r'\s*;?\s*then\s*$', '', condition).strip()
             si = ScriptInterpreter(self.shell)
             si._local_vars = dict(self._local_vars)
             res = si._eval_test(condition)
@@ -492,25 +533,33 @@ class ScriptInterpreter:
         # ------------------------------------------------------------
         body = []
         i = idx + 1
-        depth = 0
+        # Separate counters: while/for/until are closed by 'done',
+        # if/case are closed by 'fi'/'esac' — they must not interfere.
+        done_depth = 0
+        fi_depth   = 0
 
         done_line = ""
         while i < len(lines):
             line = lines[i].strip()
 
-            if line.startswith("while") or line.startswith("until") or line.startswith("if") or line.startswith("for"):
-                depth += 1
+            if re.match(r"^(while|until|for)\b", line):   done_depth += 1
+            elif re.match(r"^if\b", line):                 fi_depth   += 1
+            elif re.match(r"^case\b", line):               fi_depth   += 1
             elif re.match(r'^done\b', line):
-                if depth == 0:
+                if done_depth == 0:
                     done_line = line
                     break
-                depth -= 1
+                done_depth -= 1
+            elif re.match(r'^fi\b', line):                 fi_depth   -= 1
+            elif re.match(r'^esac\b', line):               fi_depth   -= 1
 
-            # skip bare 'do' delimiter (same as _handle_for does)
-            if line != "do" and not line.startswith("do "):
-                body.append(line)
-            elif line.startswith("do ") and line != "do":
+            # skip bare 'do' delimiter (same as _handle_for)
+            if line == "do":
+                pass
+            elif line.startswith("do "):
                 body.append(line[3:])
+            else:
+                body.append(line)
             i += 1
 
         end = i
@@ -710,12 +759,67 @@ class ScriptInterpreter:
             self.env.last_exit_code = sub._return_value or 0
             return
 
-        # delegate to shell
-        self.shell.run(line)
+        # delegate to shell — expand variables first so $i, $ip etc. are resolved
+        self.shell.run(self._expand(line))
 
     def _capture_line(self, line: str) -> str:
         """Run a line, capture stdout, return as string."""
-        line = self._expand(line)
+        line = self._expand(line).strip()
+        # Strip 2>/dev/null and similar redirections that shouldn't affect capture
+        line = re.sub(r"\s+2>/dev/null", "", line)
+        line = re.sub(r"\s+&>/dev/null", "", line)
+
+        # ssh inside $(...) with a trailing command: ssh [flags] <ip> "cmd"
+        # Pass the trailing command non-interactively and capture its output.
+        m_ssh = re.match(r'^ssh\b(.*?)\s+([\'"])(.*?)\2\s*$', line, re.DOTALL)
+        if not m_ssh:
+            # also handle unquoted trailing command: ssh [flags] <ip> cmd
+            m_ssh = re.match(r"^ssh\b(.+)$", line)
+        if m_ssh:
+            import shlex as _shlex
+            try:
+                parts = _shlex.split(line)
+            except Exception:
+                parts = line.split()
+            if parts and parts[0] == "ssh":
+                # Split: flags+ip vs trailing remote command
+                # Find the ip (first non-flag arg), everything after is the command
+                ssh_args = parts[1:]
+                ip_idx = None
+                i = 0
+                while i < len(ssh_args):
+                    if ssh_args[i] in ("-p", "-l") and i + 1 < len(ssh_args):
+                        i += 2
+                    elif ssh_args[i].startswith("-"):
+                        i += 1
+                    else:
+                        ip_idx = i
+                        break
+                if ip_idx is not None and ip_idx + 1 < len(ssh_args):
+                    # There IS a trailing command argument
+                    connect_args = ssh_args[:ip_idx + 1]  # flags + ip
+                    remote_cmd   = " ".join(ssh_args[ip_idx + 1:])
+                    from commands.connect import run_connect
+                    buf = io.StringIO()
+                    old_out = sys.stdout
+                    sys.stdout = buf
+                    try:
+                        run_connect(self.shell, connect_args, commands=[remote_cmd])
+                    finally:
+                        sys.stdout = old_out
+                    # Strip SSH handshake noise from the captured output,
+                    # keeping only lines that look like actual command output.
+                    raw = buf.getvalue()
+                    filtered = []
+                    for ln in raw.splitlines():
+                        if (ln.startswith("debug1:") or ln.startswith("SSH client") or
+                                ln.startswith("Warning:") or ln.startswith("---") or
+                                ln.startswith("The authenticity") or ln.startswith("ECDSA") or
+                                ln.startswith("Are you sure") or not ln.strip()):
+                            continue
+                        filtered.append(ln)
+                    return "\n".join(filtered) + ("\n" if filtered else "")
+
         buf = io.StringIO()
         old = sys.stdout
         sys.stdout = buf
@@ -795,12 +899,30 @@ class ScriptInterpreter:
             text
         )
 
-        # command substitution  $( cmd )
-        text = re.sub(
-            r"\$\(([^)]+)\)",
-            lambda m: self._capture_line(m.group(1)).strip(),
-            text
-        )
+        # command substitution  $( cmd )  — depth-aware to handle nested parens
+        def _cmd_subst(s):
+            result = []
+            i = 0
+            while i < len(s):
+                if s[i] == "$" and i + 1 < len(s) and s[i+1] == "(":
+                    # check it's not $(( arithmetic ))
+                    if i + 2 < len(s) and s[i+2] == "(":
+                        result.append(s[i]); i += 1; continue
+                    depth = 0; j = i + 1
+                    while j < len(s):
+                        if s[j] == "(": depth += 1
+                        elif s[j] == ")":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        j += 1
+                    inner = s[i+2:j]
+                    result.append(self._capture_line(inner).strip())
+                    i = j + 1
+                else:
+                    result.append(s[i]); i += 1
+            return "".join(result)
+        text = _cmd_subst(text)
 
         # ${VAR:-default}
         text = re.sub(
@@ -846,9 +968,12 @@ class ScriptInterpreter:
 
         text = re.sub(r"\$([A-Za-z_?]\w*|\d+)", expand_var, text)
 
-        # strip surrounding quotes
+        # Strip surrounding quotes only for single-word values, not multi-token
+        # expressions like '"foo" != "bar baz"' which _eval_test handles itself.
         if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
-            text = text[1:-1]
+            inner = text[1:-1]
+            if not any(c in inner for c in (" ", "\t")):
+                text = inner
 
         return text
 
@@ -883,7 +1008,24 @@ class ScriptInterpreter:
         if expr.startswith("! "):
             return not self._eval_test(expr[2:])
 
-        tokens = expr.split()
+        def _qtok(s):
+            """Quote-aware tokeniser: "hello world" → one token, empty "" → empty token."""
+            tokens, buf, in_q, was_quoted = [], [], None, False
+            for ch in s:
+                if in_q:
+                    if ch == in_q: in_q = None
+                    else: buf.append(ch)
+                elif ch in ('"', "'"):
+                    in_q = ch; was_quoted = True
+                elif ch in (" ", "\t"):
+                    if buf or was_quoted:
+                        tokens.append("".join(buf)); buf = []; was_quoted = False
+                else:
+                    buf.append(ch)
+            if buf or was_quoted:
+                tokens.append("".join(buf))
+            return tokens
+        tokens = _qtok(expr)
 
         # Unary file tests
         if len(tokens) == 2 and tokens[0] in ("-f", "-d", "-e", "-r", "-w", "-x", "-s", "-z", "-n"):

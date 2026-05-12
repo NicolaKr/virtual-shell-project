@@ -204,6 +204,8 @@ class Shell:
             Command("man",       "man <command>",               "show manual for a command",        self.man_cmd),
             Command("clear",     "clear",                       "clear screen",                     self.clear),
             Command("exit",      "exit [N]",                    "exit the shell",                   self.exit_cmd),
+            Command("sudo",      "sudo <command>",              "run command as root",              self.sudo_cmd),
+            Command("su",        "su [user]",                   "switch user (default: root)",      self.su_cmd),
         ]:
             self.commands[cmd.name] = cmd
 
@@ -1620,7 +1622,10 @@ class Shell:
         n       = self._flag_n(args)
         targets = self._get_file_args(args)
         if not targets:
-            print("usage: head [-n N] <file>"); return
+            text = sys.stdin.read() if not _sys.stdin.isatty() else ""
+            print("\n".join(text.splitlines()[:n]))
+            self.env.last_exit_code = 0
+            return
         try:
             node = self.resolve_path(targets[0])
         except FileNotFoundError:
@@ -1634,7 +1639,11 @@ class Shell:
         n       = self._flag_n(args)
         targets = self._get_file_args(args)
         if not targets:
-            print("usage: tail [-n N] <file>"); return
+            # no file → read from stdin (piped input)
+            text = sys.stdin.read() if not sys.stdin.isatty() else ""
+            print("\n".join(text.splitlines()[-n:]))
+            self.env.last_exit_code = 0
+            return
         try:
             node = self.resolve_path(targets[0])
         except FileNotFoundError:
@@ -1730,6 +1739,28 @@ class Shell:
         code = int(args[0]) if args and args[0].isdigit() else 0
         self.env.last_exit_code = code
         raise SystemExit(code)
+
+    def sudo_cmd(self, args: list) -> None:
+        if not args:
+            print("usage: sudo <command>"); return
+        # Simulate: become root for this one command
+        old_user = self.env.user
+        self.env.user = "root"
+        self.env.vars["USER"] = "root"
+        try:
+            self.run(" ".join(args))
+        finally:
+            self.env.user = old_user
+            self.env.vars["USER"] = old_user
+
+    def su_cmd(self, args: list) -> None:
+        target = args[0] if args else "root"
+        # In the virtual shell, su always succeeds (no real auth)
+        self.env.user = target
+        self.env.vars["USER"] = target
+        self.env.vars["HOME"] = f"/home/{target}"
+        print(f"Switched to user: {target}")
+        self.env.last_exit_code = 0
 
     def sleep_cmd(self, args: list) -> None:
         if not args:
@@ -2233,7 +2264,24 @@ class Shell:
 
     def ssh_cmd(self, args: list) -> None:
         from commands.connect import run_connect
-        run_connect(self, args)
+        # Detect trailing remote command:  ssh [flags] <ip> "remote cmd"
+        # Find the IP position (first non-flag arg), everything after is the command.
+        remote_cmd = None
+        ip_idx = None
+        i = 0
+        while i < len(args):
+            if args[i] in ("-p", "-l") and i + 1 < len(args):
+                i += 2
+            elif args[i].startswith("-"):
+                i += 1
+            else:
+                ip_idx = i
+                break
+        if ip_idx is not None and ip_idx + 1 < len(args):
+            remote_cmd = " ".join(args[ip_idx + 1:])
+            args = args[:ip_idx + 1]
+
+        run_connect(self, args, commands=[remote_cmd] if remote_cmd else None)
 
     def ifconfig(self, args: list) -> None:
         print("eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500")

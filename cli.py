@@ -170,14 +170,13 @@ def solution(task_level: int):
     elif task_level == 2:
         pass
     elif task_level == 3:
+        # command for level 3 nmap 192.168 | awk '/Nmap scan report for/ { ip=$NF; gsub(/[()]/,"",ip) }/Auth: authentication: open/ { print ip }'  > ip.txt
         pass
     else:
         print("no such task!")
 
     print("The codename is:")
     print(CURRENT_CODENAME)
-
-
 
 
 

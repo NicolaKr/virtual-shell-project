@@ -123,6 +123,32 @@ _FS: dict = {
 # Text / shell utilities
 # ---------------------------------------------------------------------------
 _TEXT: dict = {
+    "tail": {
+        "desc": "Print the last N lines of a file or piped input (default: 10).",
+        "flags": [
+            ("-n N", "print the last N lines instead of the default 10"),
+        ],
+        "examples": [
+            ("tail file.txt",              "print last 10 lines of file.txt"),
+            ("tail -n 1 file.txt",         "print only the last line"),
+            ("cat file.txt | tail -n 5",   "last 5 lines of piped input"),
+            ("ssh 192.168.0.5 'cat readme.md' | tail -n 1",
+             "read last line of a remote file"),
+        ],
+        "tip": "Use tail -n 1 to grab just the final line — handy for extracting a result or codename at the end of a file.",
+    },
+    "head": {
+        "desc": "Print the first N lines of a file or piped input (default: 10).",
+        "flags": [
+            ("-n N", "print the first N lines instead of the default 10"),
+        ],
+        "examples": [
+            ("head file.txt",            "print first 10 lines of file.txt"),
+            ("head -n 3 file.txt",       "print only the first 3 lines"),
+            ("cat file.txt | head -n 1", "first line of piped input"),
+        ],
+        "tip": "Pair with tail to extract specific line ranges from large files.",
+    },
     "echo": {
         "desc": "Print text to the screen. Variables are expanded automatically.",
         "flags": [("-n", "omit the trailing newline")],
