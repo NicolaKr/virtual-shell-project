@@ -210,18 +210,39 @@ class ScriptInterpreter:
                 return val
 
             # normal line
-            # ssh from a script — connect interactively, then continue locally
-            if re.match(r'^ssh', line):
+            # ssh from a script — pass only remote commands (up to break/continue/done)
+            # to run_connect; local control words stay in the local loop
+            if re.match(r'^ssh\b', line):
                 import shlex as _shlex
                 expanded = self._expand(line)
                 try:
                     parts = _shlex.split(expanded)
                 except Exception:
                     parts = expanded.split()
-                remaining = [l.strip() for l in lines[idx+1:] if l.strip()]
-                print("remaining:", remaining)
+                # Collect lines that belong to the remote session (until a
+                # local control word or end of body)
+                LOCAL_CONTROLS = {"break", "continue", "return", "exit", "done"}
+                remote_cmds = []
+                local_after = []
+                reached_local = False
+                for l in lines[idx+1:]:
+                    ls = l.strip()
+                    if not ls:
+                        continue
+                    if ls in LOCAL_CONTROLS or re.match(r'^(break|continue|return|exit)\b', ls):
+                        reached_local = True
+                        local_after.append(ls)
+                    elif reached_local:
+                        local_after.append(ls)
+                    else:
+                        remote_cmds.append(ls)
                 from commands.connect import run_connect
-                run_connect(self.shell, parts[1:], commands=remaining)
+                run_connect(self.shell, parts[1:], commands=remote_cmds if remote_cmds else None)
+                # now execute local control words (break etc.)
+                for lcmd in local_after:
+                    self._run_line(lcmd)
+                    if self._break_flag or self._continue_flag or self._return_value is not None:
+                        break
                 return self._return_value or 0
             else:
                 self._run_line(line)
