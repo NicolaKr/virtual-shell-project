@@ -2,6 +2,9 @@ import datetime
 import random
 import string
 from typing import Dict, Any
+from utils import (random_password, choose_random_directory, rand_config, rand_script, rand_kernel,
+                   collect_candidate_dirs, rand_ip, rand_data, rand_log_lines, rand_crontab)
+from virtual_shell import VirtualEnvironment
 
 SECRET_FOLDER_NAME = "CodeName"
 
@@ -56,164 +59,6 @@ def _mk(name, parent, content, owner="root", permissions=None):
                 owner=owner, permissions=permissions or "rw-r--r--")
 
 
-def _rand_ip():
-    return f"192.168.{random.randint(0,2)}.{random.randint(1,254)}"
-
-
-def _rand_date(days_back=365):
-    d = datetime.datetime.now() - datetime.timedelta(days=random.randint(0, days_back))
-    return d.strftime("%Y-%m-%d")
-
-
-def _rand_log_lines(service="syslog", count=8):
-    users = ["root", "admin", "ubuntu", "deploy"]
-    msgs = {
-        "sshd": [
-            "Accepted password for {u} from {ip} port {p}",
-            "Failed password for {u} from {ip} port {p}",
-            "pam_unix(sshd:session): session opened for user {u}",
-            "Disconnected from {ip}: Bye Bye",
-            "Server listening on 0.0.0.0 port 22",
-        ],
-        "nginx": [
-            '{ip} - - [{date}] "GET /index.html HTTP/1.1" 200 1234',
-            '{ip} - - [{date}] "POST /api/login HTTP/1.1" 401 89',
-            '{ip} - - [{date}] "GET /robots.txt HTTP/1.1" 404 0',
-            "Starting nginx: nginx.",
-        ],
-        "cron": [
-            "CRON[{pid}]: ({u}) CMD (/usr/bin/backup.sh)",
-            "CRON[{pid}]: ({u}) CMD (find /tmp -mtime +7 -delete)",
-        ],
-        "kernel": [
-            "EXT4-fs (sda1): mounted filesystem",
-            "NET: Registered protocol family 2",
-            "random: crng init done",
-        ],
-        "syslog": [
-            "kernel: EXT4-fs (sda1): mounted filesystem",
-            "sshd[{pid}]: Server listening on 0.0.0.0 port 22",
-            "cron[{pid}]: ({u}) CMD (/usr/bin/backup.sh)",
-            "systemd[1]: Starting OpenSSH server daemon...",
-            "kernel: random: crng init done",
-        ],
-    }
-    all_msgs = []
-    for svc_msgs in msgs.values():
-        all_msgs.extend(svc_msgs)
-    lines = []
-    for _ in range(count):
-        tmpl = random.choice(all_msgs)
-        line = tmpl.format(
-            u=random.choice(users), ip=_rand_ip(),
-            p=random.randint(40000, 65000), date=_rand_date(30),
-            pid=random.randint(1000, 9999),
-        )
-        dt = datetime.datetime.now() - datetime.timedelta(
-            hours=random.randint(0, 72), minutes=random.randint(0, 59))
-        ts = dt.strftime("%b %d %H:%M:%S")
-        lines.append(f"{ts} {service}[{random.randint(100,9999)}]: {line}")
-    return "\n".join(sorted(lines))
-
-
-def _rand_crontab(user):
-    jobs = [
-        "0 * * * * /usr/bin/python3 /opt/scripts/monitor.py >> /var/log/monitor.log 2>&1",
-        "*/15 * * * * /usr/local/bin/health_check.sh",
-        "0 2 * * * /usr/bin/find /tmp -mtime +7 -delete",
-        f"30 3 * * 0 /usr/bin/backup.sh /home/{user} /backup/weekly",
-        "@reboot /opt/services/startup.sh",
-        "5 4 * * 1 /usr/sbin/logrotate /etc/logrotate.conf",
-    ]
-    header = f"# Crontab for {user}\n# m h dom mon dow command\n"
-    return header + "\n".join(random.sample(jobs, random.randint(2, 4)))
-
-
-def _rand_config(service):
-    configs = {
-        "nginx": (
-            "server {\n"
-            "    listen 80;\n"
-            "    server_name _;\n\n"
-            "    root /var/www/html;\n"
-            "    index index.html index.htm;\n\n"
-            "    access_log /var/log/nginx/access.log;\n"
-            "    error_log  /var/log/nginx/error.log warn;\n\n"
-            "    location / {\n"
-            "        try_files $uri $uri/ =404;\n"
-            "    }\n\n"
-            "    location /api/ {\n"
-            "        proxy_pass http://127.0.0.1:8080;\n"
-            "        proxy_set_header Host $host;\n"
-            "    }\n"
-            "}"
-        ),
-        "mysql": (
-            "[mysqld]\n"
-            "user            = mysql\n"
-            "pid-file        = /var/run/mysqld/mysqld.pid\n"
-            "socket          = /var/run/mysqld/mysqld.sock\n"
-            "port            = 3306\n"
-            "basedir         = /usr\n"
-            "datadir         = /var/lib/mysql\n"
-            "bind-address    = 127.0.0.1\n"
-            "max_connections = 100\n"
-            "log_error       = /var/log/mysql/error.log\n"
-        ),
-        "sshd": (
-            "Port 22\n"
-            "Protocol 2\n"
-            "HostKey /etc/ssh/ssh_host_rsa_key\n"
-            "PermitRootLogin no\n"
-            "PasswordAuthentication yes\n"
-            "ChallengeResponseAuthentication no\n"
-            "UsePAM yes\n"
-            "X11Forwarding no\n"
-            "PrintMotd no\n"
-            f"AllowUsers {random.choice(['admin','ubuntu','deploy','student'])}\n"
-            "Subsystem sftp /usr/lib/openssh/sftp-server\n"
-        ),
-    }
-    return configs.get(service, f"# {service} configuration\n# Generated automatically\n")
-
-
-def _rand_script(name):
-    scripts = {
-        "backup.sh": (
-            "#!/bin/bash\n# Automated backup script\nset -euo pipefail\n\n"
-            "BACKUP_DIR=/backup/$(date +%Y%m%d)\nmkdir -p \"$BACKUP_DIR\"\n\n"
-            "echo \"[$(date)] Starting backup...\"\n"
-            "tar -czf \"$BACKUP_DIR/home.tar.gz\" /home/\n"
-            "tar -czf \"$BACKUP_DIR/etc.tar.gz\" /etc/\n"
-            "echo \"[$(date)] Backup complete: $BACKUP_DIR\"\n"
-        ),
-        "monitor.py": (
-            "#!/usr/bin/env python3\n\"\"\"Simple health-check monitor.\"\"\"\n"
-            "import subprocess, datetime, sys\n\n"
-            "SERVICES = ['nginx', 'sshd', 'cron']\n\n"
-            "for svc in SERVICES:\n"
-            "    r = subprocess.run(['systemctl', 'is-active', svc],\n"
-            "                       capture_output=True, text=True)\n"
-            "    status = r.stdout.strip()\n"
-            "    ts = datetime.datetime.now().isoformat()\n"
-            "    print(f'[{ts}] {svc}: {status}')\n"
-        ),
-        "deploy.sh": (
-            "#!/bin/bash\n# Deployment script\nset -e\n\n"
-            "APP_DIR=/opt/app\nREPO_URL=https://git.internal/team/app.git\n\n"
-            "echo \"Pulling latest changes...\"\n"
-            "cd \"$APP_DIR\"\ngit pull origin main\n"
-            "pip3 install -r requirements.txt --quiet\n"
-            "systemctl restart app\necho \"Deploy complete.\"\n"
-        ),
-        "health_check.sh": (
-            "#!/bin/bash\n# Health check\nfor svc in nginx ssh; do\n"
-            "    systemctl is-active --quiet $svc && echo \"$svc: OK\" || echo \"$svc: FAILED\"\ndone\n"
-        ),
-    }
-    return scripts.get(name, f"#!/bin/bash\n# {name}\necho 'done'\n")
-
-
 DISTRO_PKGS = {
     "Ubuntu 22.04 LTS":  ["nginx/1.18.0", "openssh-server/8.9p1", "python3/3.10.6", "curl/7.81.0"],
     "Ubuntu 24.04 LTS":  ["nginx/1.24.0", "openssh-server/9.6p1", "python3/3.12.3", "curl/8.5.0"],
@@ -226,7 +71,13 @@ DISTRO_PKGS = {
 }
 
 
-def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str = "", is_target: bool = False):
+def build_remote_filesystem(
+        env: VirtualEnvironment,
+        host_info: dict,
+        auth_user: str,
+        codename: str = "",
+        is_target: bool = False
+):
     """Populate a fresh VirtualEnvironment with a realistic per-host filesystem."""
     root      = env.root
     os_name   = host_info.get("os", "Ubuntu 22.04 LTS")
@@ -271,7 +122,7 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
     # /etc/ssh/
     etc_ssh = Node("ssh", etc, is_dir=True)
     etc.children["ssh"] = etc_ssh
-    etc_ssh.children["sshd_config"]     = _mk("sshd_config",     etc_ssh, _rand_config("sshd"))
+    etc_ssh.children["sshd_config"]     = _mk("sshd_config",     etc_ssh, rand_config("sshd"))
     etc_ssh.children["ssh_config"]      = _mk("ssh_config",      etc_ssh,
         "Host *\n    ServerAliveInterval 60\n    StrictHostKeyChecking ask\n")
     etc_ssh.children["ssh_host_rsa_key"] = _mk("ssh_host_rsa_key", etc_ssh,
@@ -284,7 +135,7 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
     crond = Node("cron.d", etc, is_dir=True)
     etc.children["cron.d"] = crond
     crond.children[f"{auth_user}-tasks"] = _mk(f"{auth_user}-tasks", crond,
-                                                _rand_crontab(auth_user))
+                                                rand_crontab(auth_user))
     crond.children["logrotate"] = _mk("logrotate", crond,
         "0 0 * * * root /usr/sbin/logrotate /etc/logrotate.conf\n")
 
@@ -348,12 +199,12 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
     })
 
     # /var/log/
-    var_log.children["syslog"]   = _mk("syslog",   var_log, _rand_log_lines("syslog",  12), owner="syslog")
-    var_log.children["auth.log"] = _mk("auth.log", var_log, _rand_log_lines("sshd",    10), owner="syslog")
-    var_log.children["kern.log"] = _mk("kern.log", var_log, _rand_log_lines("kernel",   6), owner="syslog")
+    var_log.children["syslog"]   = _mk("syslog",   var_log, rand_log_lines("syslog",  12), owner="syslog")
+    var_log.children["auth.log"] = _mk("auth.log", var_log, rand_log_lines("sshd",    10), owner="syslog")
+    var_log.children["kern.log"] = _mk("kern.log", var_log, rand_log_lines("kernel",   6), owner="syslog")
     var_log.children["dpkg.log"] = _mk("dpkg.log", var_log,
-        f"{_rand_date(30)} startup archives dpkg\n"
-        f"{_rand_date(30)} install openssh-server:amd64 <none> 1:8.9p1\n",
+        f"{rand_data(30)} startup archives dpkg\n"
+        f"{rand_data(30)} install openssh-server:amd64 <none> 1:8.9p1\n",
         owner="root")
     var_log.children["boot.log"] = _mk("boot.log", var_log,
         "[ OK ] Started OpenSSH Server Daemon.\n"
@@ -365,7 +216,7 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
     apt_log = Node("apt", var_log, is_dir=True)
     var_log.children["apt"] = apt_log
     apt_log.children["history.log"] = _mk("history.log", apt_log,
-        f"Start-Date: {_rand_date(60)}\n"
+        f"Start-Date: {rand_data(60)}\n"
         "Commandline: apt-get install -y openssh-server\n"
         "Install: openssh-server\nEnd-Date: done\n")
     apt_log.children["term.log"] = _mk("term.log", apt_log,
@@ -374,15 +225,15 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
     if host_type in ("web", "generic"):
         nginx_log = Node("nginx", var_log, is_dir=True)
         var_log.children["nginx"] = nginx_log
-        nginx_log.children["access.log"] = _mk("access.log", nginx_log, _rand_log_lines("nginx", 15))
+        nginx_log.children["access.log"] = _mk("access.log", nginx_log, rand_log_lines("nginx", 15))
         nginx_log.children["error.log"]  = _mk("error.log",  nginx_log, "")
 
     if host_type == "db":
         mysql_log = Node("mysql", var_log, is_dir=True)
         var_log.children["mysql"] = mysql_log
         mysql_log.children["error.log"] = _mk("error.log", mysql_log,
-            f"{_rand_date(5)} [Note] mysqld: ready for connections.\n"
-            f"{_rand_date(3)} [Warning] Aborted connection from {_rand_ip()}\n")
+            f"{rand_data(5)} [Note] mysqld: ready for connections.\n"
+            f"{rand_data(3)} [Warning] Aborted connection from {rand_ip()}\n")
 
     # /var/lib/
     dpkg = Node("dpkg", var_lib, is_dir=True)
@@ -412,11 +263,11 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
     crontabs = Node("crontabs", cron_spool, is_dir=True, permissions="rwx------", owner="root")
     cron_spool.children["crontabs"] = crontabs
     crontabs.children[auth_user] = _mk(auth_user, crontabs,
-        _rand_crontab(auth_user), owner=auth_user, permissions="rw-------")
+        rand_crontab(auth_user), owner=auth_user, permissions="rw-------")
     mail_spool = Node("mail", var_spool, is_dir=True)
     var_spool.children["mail"] = mail_spool
     mail_spool.children[auth_user] = _mk(auth_user, mail_spool,
-        f"From root@{env.hostname} {_rand_date(10)}\n"
+        f"From root@{env.hostname} {rand_data(10)}\n"
         "Subject: System notification\n\nScheduled maintenance complete.\n",
         owner=auth_user)
 
@@ -466,7 +317,7 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
     opt.children["scripts"] = scripts_dir
     for sname in random.sample(["backup.sh", "monitor.py", "deploy.sh", "health_check.sh"],
                                random.randint(2, 4)):
-        scripts_dir.children[sname] = _mk(sname, scripts_dir, _rand_script(sname),
+        scripts_dir.children[sname] = _mk(sname, scripts_dir, rand_script(sname),
                                            permissions="rwxr-xr-x")
     scripts_dir.children["README"] = _mk("README", scripts_dir,
         "# Operational scripts\nRun with appropriate privileges.\n"
@@ -489,7 +340,7 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
         mysql_dir = Node("mysql", opt, is_dir=True)
         opt.children["mysql"] = mysql_dir
         mysql_dir.children["my.cnf"] = _mk("my.cnf", mysql_dir,
-            _rand_config("mysql"), owner="mysql")
+            rand_config("mysql"), owner="mysql")
         schemas = Node("schemas", mysql_dir, is_dir=True)
         mysql_dir.children["schemas"] = schemas
         schemas.children["app_db.sql"] = _mk("app_db.sql", schemas,
@@ -508,7 +359,7 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
             owner=auth_user, permissions="rw-------")
         dumps = Node("dumps", mysql_dir, is_dir=True)
         mysql_dir.children["dumps"] = dumps
-        d = _rand_date(14)
+        d = rand_data(14)
         dumps.children[f"app_db_{d}.sql.gz"] = _mk(f"app_db_{d}.sql.gz", dumps,
             "# mysqldump binary placeholder\n", owner=auth_user)
 
@@ -622,7 +473,7 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
     history_cmds = random.sample([
         "ls -la", "cd /var/log", "cat syslog", "ps aux", "df -h", "top",
         "cd /opt/scripts", "bash backup.sh",
-        f"ssh root@{_rand_ip()}", "tail -f /var/log/auth.log",
+        f"ssh root@{rand_ip()}", "tail -f /var/log/auth.log",
         "grep 'Failed' /var/log/auth.log", "netstat -tlnp", "free -h",
         "uptime", "cat /etc/passwd", "id", "whoami", "ls -la /opt/scripts",
         "crontab -l", "find / -name '*.log' 2>/dev/null",
@@ -639,7 +490,7 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
         f"ssh-rsa AAAAB3NzaC1yc2EAAAA {auth_user}@workstation\n",
         owner=auth_user, permissions="rw-------")
     ssh_home.children["known_hosts"] = _mk("known_hosts", ssh_home,
-        f"192.168.0.1 ecdsa-sha2-nistp256 AAAA{_rand_date()}\n",
+        f"192.168.0.1 ecdsa-sha2-nistp256 AAAA{rand_data()}\n",
         owner=auth_user, permissions="rw-------")
 
     # readme / hint
@@ -656,14 +507,14 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
     docs = Node("documents", user_home, is_dir=True, owner=auth_user)
     user_home.children["documents"] = docs
     docs.children["notes.txt"] = _mk("notes.txt", docs,
-        f"Personal notes – {_rand_date(30)}\n\n"
+        f"Personal notes – {rand_data(30)}\n\n"
         "- Review server configs\n- Check backup logs\n"
-        f"- Meeting with team on {_rand_date(10)}\n", owner=auth_user)
+        f"- Meeting with team on {rand_data(10)}\n", owner=auth_user)
     docs.children["server_inventory.txt"] = _mk("server_inventory.txt", docs,
-        f"# Server Inventory – updated {_rand_date(7)}\n"
+        f"# Server Inventory – updated {rand_data(7)}\n"
         f"192.168.0.1  gateway-router  core\n"
-        f"{_rand_ip()}  app-server     web\n"
-        f"{_rand_ip()}  db-primary     db\n", owner=auth_user)
+        f"{rand_ip()}  app-server     web\n"
+        f"{rand_ip()}  db-primary     db\n", owner=auth_user)
 
     # ~/bin/
     user_bin = Node("bin", user_home, is_dir=True, owner=auth_user)
@@ -678,13 +529,13 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
         extra = Node(extra_name, user_home, is_dir=True, owner=auth_user)
         user_home.children[extra_name] = extra
         extra.children["info.txt"] = _mk("info.txt", extra,
-            f"# {extra_name}\nManaged by {auth_user}\nLast updated: {_rand_date(60)}\n",
+            f"# {extra_name}\nManaged by {auth_user}\nLast updated: {rand_data(60)}\n",
             owner=auth_user)
         if extra_name == "projects" or random.random() < 0.3:
             sub = Node("archive", extra, is_dir=True, owner=auth_user)
             extra.children["archive"] = sub
-            sub.children[f"backup_{_rand_date(90)}.tar.gz"] = _mk(
-                f"backup_{_rand_date(90)}.tar.gz", sub,
+            sub.children[f"backup_{rand_data(90)}.tar.gz"] = _mk(
+                f"backup_{rand_data(90)}.tar.gz", sub,
                 "# archive placeholder\n", owner=auth_user)
 
     # ── /tmp ─────────────────────────────────────────────────────────────
@@ -706,7 +557,7 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
                                               permissions="r-xr-xr-x", owner="root")
     root.children["proc"] = proc
     proc.children["version"]  = _mk("version", proc,
-        f"Linux version {_rand_kernel()} (gcc version 11.3.0)\n",
+        f"Linux version {rand_kernel()} (gcc version 11.3.0)\n",
         owner="root", permissions="r--r--r--")
     proc.children["uptime"]   = _mk("uptime", proc,
         f"{random.randint(100,9999)}.{random.randint(0,99)} "
@@ -730,68 +581,47 @@ def build_remote_filesystem(env, host_info: dict, auth_user: str, codename: str 
 
     # ── Codename challenge files (target host only) ────────────────────
     if is_target and codename:
-        _plant_codename_files(root, user_home, auth_user, codename)
+        print("env", env.challenge_level)
+        _plant_codename_files(root, user_home, auth_user, codename, env.challenge_level)
 
 
-def _plant_codename_files(root: Node, user_home: Node, auth_user: str, codename: str):
+def _plant_codename_files(root: Node, user_home: Node, auth_user: str, codename: str, level: int):
     """
     Plant the codename challenge on the target host:
       <parent>/<CODENAME>Folder/readme.txt   – visible clue
       <parent>/<CODENAME>Folder/.codename    – hidden secret file
     The folder is placed at a random spot in the filesystem.
     """
-    folder_name = f"{SECRET_FOLDER_NAME}"
+    if level == 1:
+        folder_name = f"{SECRET_FOLDER_NAME}"
 
-    candidates = [user_home]
-    for child in list(user_home.children.values()):
-        if child.is_dir:
-            candidates.append(child)
+        chosen = choose_random_directory(collect_candidate_dirs(root, user_home))
 
-    opt = root.children.get("opt")
-    if opt:
-        for child in list(opt.children.values()):
-            if child.is_dir:
-                candidates.append(child)
+        cn_folder = Node(folder_name, chosen, is_dir=True, owner=auth_user)
+        cn_folder.children = {}
 
-    tmp = root.children.get("tmp")
-    if tmp:
-        candidates.append(tmp)
+        cn_folder.children["readme.txt"] = _mk("readme.txt", cn_folder,
+            f"You found the right directory.\n\n"
+            f"The codename file is hidden somewhere in this folder.\n"
+            f"Look carefully — hidden files start with a dot (.)\n\n"
+            f"Try:  ls -la\n",
+            owner=auth_user)
 
-    chosen = random.choice(candidates)
+        cn_folder.children[".codename"] = _mk(".codename", cn_folder,
+            f"CODENAME: {codename}\n\n"
+            f"Congratulations — you found the secret file.\n"
+            f"Record this codename and report back.\n",
+            owner=auth_user, permissions="rw-------")
 
-    cn_folder = Node(folder_name, chosen, is_dir=True, owner=auth_user)
-    cn_folder.children = {}
-
-    cn_folder.children["readme.txt"] = _mk("readme.txt", cn_folder,
-        f"You found the right directory.\n\n"
-        f"The codename file is hidden somewhere in this folder.\n"
-        f"Look carefully — hidden files start with a dot (.)\n\n"
-        f"Try:  ls -la\n",
-        owner=auth_user)
-
-    cn_folder.children[".codename"] = _mk(".codename", cn_folder,
-        f"CODENAME: {codename}\n\n"
-        f"Congratulations — you found the secret file.\n"
-        f"Record this codename and report back.\n",
-        owner=auth_user, permissions="rw-------")
-
-    chosen.children[folder_name] = cn_folder
+        chosen.children[folder_name] = cn_folder
 
 
 # ---------------------------------------------------------------------------
 # VirtualEnvironment
 # ---------------------------------------------------------------------------
 
-def _rand_kernel():
-    patch = random.randint(0, 30)
-    minor = random.choice([15, 16, 17, 18, 19])
-    major = random.choice([5, 6])
-    return (f"{major}.{minor}.{patch}-{random.randint(1,9)}-generic "
-            f"#{random.randint(30,99)}-Ubuntu SMP x86_64")
-
-
 def _build_motd(hostname: str, os_name: str) -> str:
-    kernel = _rand_kernel()
+    kernel = rand_kernel()
     pkgs   = random.randint(200, 800)
     sec    = random.randint(0, pkgs)
     load   = round(random.uniform(0.01, 2.5), 2)
@@ -802,7 +632,7 @@ def _build_motd(hostname: str, os_name: str) -> str:
     procs  = random.randint(80, 300)
     users  = random.randint(0, 3)
     now    = datetime.datetime.now().strftime("%a %b %d %H:%M:%S UTC %Y")
-    eth_ip = _rand_ip()
+    eth_ip = rand_ip()
     lines = [
         f"Welcome to {os_name} (GNU/Linux {kernel.split()[0]})",
         "",
@@ -832,6 +662,7 @@ class VirtualEnvironment:
     def __init__(self, codename: str = "", num_public: int = 5, num_private: int = 3):
         self.root = Node("/", permissions="rwxr-xr-x")
         self.cwd  = self.root
+        self.challenge_level = 0
         self.vars = {
             "HOME":  "/home/student",
             "USER":  "student",
@@ -934,7 +765,7 @@ class VirtualEnvironment:
         crond = Node("cron.d", etc, is_dir=True)
         etc.children["cron.d"] = crond
         crond.children["student-tasks"] = _mk("student-tasks", crond,
-            _rand_crontab("student"))
+            rand_crontab("student"))
         crond.children["syslog"] = _mk("syslog", crond,
             "# Rotate logs daily\n0 0 * * * root /usr/sbin/logrotate /etc/logrotate.conf\n")
 
@@ -991,9 +822,9 @@ class VirtualEnvironment:
         })
 
         # /var/log/
-        var_log.children["syslog"]    = _mk("syslog",    var_log, _rand_log_lines("syslog",  15), owner="syslog")
-        var_log.children["auth.log"]  = _mk("auth.log",  var_log, _rand_log_lines("sshd",    10), owner="syslog")
-        var_log.children["kern.log"]  = _mk("kern.log",  var_log, _rand_log_lines("kernel",   8), owner="syslog")
+        var_log.children["syslog"]    = _mk("syslog",    var_log, rand_log_lines("syslog",  15), owner="syslog")
+        var_log.children["auth.log"]  = _mk("auth.log",  var_log, rand_log_lines("sshd",    10), owner="syslog")
+        var_log.children["kern.log"]  = _mk("kern.log",  var_log, rand_log_lines("kernel",   8), owner="syslog")
         var_log.children["dpkg.log"]  = _mk("dpkg.log",  var_log,
             f"2024-01-15 02:30:01 startup archives dpkg\n"
             f"2024-01-15 02:30:01 install openssh-server:amd64 <none> 1:8.9p1\n"
@@ -1012,7 +843,7 @@ class VirtualEnvironment:
         apt_log = Node("apt", var_log, is_dir=True)
         var_log.children["apt"] = apt_log
         apt_log.children["history.log"] = _mk("history.log", apt_log,
-            f"Start-Date: {_rand_date(30)}\n"
+            f"Start-Date: {rand_data(30)}\n"
             "Commandline: apt-get install -y openssh-server nginx\n"
             "Install: openssh-server, nginx\nEnd-Date: done\n")
         apt_log.children["term.log"] = _mk("term.log", apt_log,
@@ -1043,7 +874,7 @@ class VirtualEnvironment:
         crontabs = Node("crontabs", cron_spool, is_dir=True, permissions="rwx------", owner="root")
         cron_spool.children["crontabs"] = crontabs
         crontabs.children["student"] = _mk("student", crontabs,
-            _rand_crontab("student"), owner="student", permissions="rw-------")
+            rand_crontab("student"), owner="student", permissions="rw-------")
         mail_spool = Node("mail", var_spool, is_dir=True)
         var_spool.children["mail"] = mail_spool
         mail_spool.children["student"] = _mk("student", mail_spool,
@@ -1148,9 +979,9 @@ class VirtualEnvironment:
         scripts_dir = Node("scripts", opt, is_dir=True)
         opt.children["scripts"] = scripts_dir
         scripts_dir.children["backup.sh"] = _mk("backup.sh", scripts_dir,
-            _rand_script("backup.sh"), permissions="rwxr-xr-x")
+            rand_script("backup.sh"), permissions="rwxr-xr-x")
         scripts_dir.children["monitor.py"] = _mk("monitor.py", scripts_dir,
-            _rand_script("monitor.py"), permissions="rwxr-xr-x")
+            rand_script("monitor.py"), permissions="rwxr-xr-x")
 
         services_dir = Node("services", opt, is_dir=True)
         opt.children["services"] = services_dir
@@ -1163,7 +994,7 @@ class VirtualEnvironment:
 
         # ── /proc (stub — realistic-looking, not functional) ─────────────
         proc.children["version"]   = _mk("version", proc,
-            f"Linux version {_rand_kernel()} (gcc version 11.3.0)\n",
+            f"Linux version {rand_kernel()} (gcc version 11.3.0)\n",
             owner="root", permissions="r--r--r--")
         proc.children["uptime"]    = _mk("uptime",  proc,
             f"{random.randint(100,9999)}.{random.randint(0,99)} "
@@ -1249,7 +1080,7 @@ class VirtualEnvironment:
         ssh_dir_home = Node(".ssh", sh, is_dir=True, owner="student", permissions="rwx------")
         sh.children[".ssh"] = ssh_dir_home
         ssh_dir_home.children["known_hosts"] = _mk("known_hosts", ssh_dir_home,
-            f"# known hosts\n192.168.0.1 ecdsa-sha2-nistp256 AAAA{_rand_date()}\n",
+            f"# known hosts\n192.168.0.1 ecdsa-sha2-nistp256 AAAA{rand_data()}\n",
             owner="student", permissions="rw-------")
         ssh_dir_home.children["config"] = _mk("config", ssh_dir_home,
             "Host *\n    ServerAliveInterval 60\n    StrictHostKeyChecking ask\n",
@@ -1273,8 +1104,8 @@ class VirtualEnvironment:
     # ------------------------------------------------------------------
     # Home directory builders
     # ------------------------------------------------------------------
-    def update_random_network(self, num_public: int = 5, num_private: int = 3):
-        self.generate_random_network(self.codename, num_public, num_private)
+    def update_random_network(self, num_public: int = 5, num_private: int = 3, codename_in_public: bool=True):
+        self.generate_random_network(self.codename, num_public, num_private, codename_in_public)
 
 
     def build_default_home(self):
@@ -1296,6 +1127,7 @@ class VirtualEnvironment:
 
     def setup_level1(self):
         """Level 1 home: guided intro — student just needs to scan and connect."""
+        self.challenge_level = 1
         sh = self.student_home
         sh.children = {
             "readme.md": Node("readme.md", sh, False,
@@ -1314,40 +1146,42 @@ class VirtualEnvironment:
 
     def setup_level2(self):
         """Level 2 home: less hand-holding, introduce private hosts."""
+        self.challenge_level = 2
+
         sh = self.student_home
-        scripts = Node("scripts", sh, True, owner="student")
-        scripts.children = {
-            "recon.sh": Node("recon.sh", scripts, False,
-                "#!/bin/bash\n# Reconnaissance helper\n"
-                "# Usage: fill in the blanks and run with bash recon.sh\n\n"
-                "TARGET_RANGE=\"192.168.0\"\n"
-                "# Step 1: scan the range\n"
-                "# scan $TARGET_RANGE\n\n"
-                "# Step 2: connect to a promising host\n"
-                "# connect <ip>\n",
-                owner="student", permissions="rwxr-xr-x"),
-        }
+
+        # -------------------------------------------------
+        # Task Description
+        # -------------------------------------------------
         sh.children = {
-            "readme.md": Node("readme.md", sh, False,
-                "# Level 2 – Go Deeper\n\n"
-                "The network has both public and private hosts now.\n"
-                "Private hosts require a password — you may need to look around\n"
-                "to find credentials.\n\n"
-                "## Tips\n"
-                "- Check log files on connected hosts (`/var/log/`)\n"
-                "- Look at `.bash_history` for clues\n"
-                "- The codename may be deeper in the filesystem this time\n"),
-            "scripts": scripts,
-            "notes.txt": Node("notes.txt", sh, False,
-                f"Reconnaissance notes\n"
-                f"Date: {_rand_date(3)}\n\n"
-                "- Remember to check /var/log/auth.log for login history\n"
-                "- Private hosts may expose passwords in config files\n"
-                "- Hidden directories can contain important files\n"),
+            "Task2.md": Node(
+                "Task2.md",
+                sh,
+                False,
+                "# Task 2 – Private Hosts\n\n"
+                 "The network now contains password-protected systems.\n"
+                 "Your objective is to obtain valid credentials and access\n"
+                 "a protected host.\n\n"
+                 "Hints:\n"
+                 "- Explore the filesystem carefully\n"
+                 "- Some files may only be readable by privileged users\n"
+                 "- Use commands like find, grep, ls, cat, and su\n"
+                 "- Check common system directories\n",
+                 owner="student",
+                 permissions="rw-r--r--"
+            )
         }
+
+        # -------------------------------------------------
+        # Create /etc/network_pwd
+        # Contains credentials for protected hosts
+        # -------------------------------------------------
+        self.rebuild_network_pwd()
 
     def setup_level3(self):
         """Level 3 home: minimal hints — student is on their own."""
+        self.challenge_level = 3
+
         sh = self.student_home
         sh.children = {
             "readme.md": Node("readme.md", sh, False,
@@ -1360,7 +1194,8 @@ class VirtualEnvironment:
                 permissions="rw-------", owner="student"),
         }
 
-    def generate_random_network(self, codename: str, num_public: int = 5, num_private: int = 3):
+    def generate_random_network(self, codename: str, num_public: int = 5, num_private: int = 3,
+                                codename_in_public: bool = True):
         if num_public <= 0:
             num_public = 1
         total = max(1, num_public + max(0, num_private))
@@ -1398,13 +1233,18 @@ class VirtualEnvironment:
         host_types = ["web", "db", "generic"]
 
         network: Dict[str, Any] = {}
-        codename_ip = random.choice(public_ips) if codename else None
+        codename_ip = None
+        if bool(codename):
+            if codename_in_public:
+                codename_ip = random.choice(public_ips)
+            else:
+                codename_ip = random.choice(private_ips)
 
         for ip in public_ips:
             last      = ip.split(".")[-1]
             host_type = random.choice(host_types)
             os_choice = random.choice(os_choices)
-            is_target = (ip == codename_ip and bool(codename))
+            is_target = (ip == codename_ip and codename_in_public)
             prefix    = {"web": "web", "db": "db", "generic": "host"}[host_type]
             name      = f"{prefix}-{last}"
 
@@ -1429,7 +1269,7 @@ class VirtualEnvironment:
                 "is_target":    is_target,
                 "codename":     codename if is_target else "",
                 "uptime_days":  random.randint(1, 400),
-                "kernel":       _rand_kernel(),
+                "kernel":       rand_kernel(),
                 "ssh_version":  f"SSH-2.0-OpenSSH_{random.choice(['8.9p1','9.2p1','9.6p1','8.4p1'])}",
             }
 
@@ -1437,11 +1277,18 @@ class VirtualEnvironment:
             last        = ip.split(".")[-1]
             host_type   = random.choice(host_types)
             os_choice   = random.choice(os_choices)
-            is_honeypot = random.random() < 0.2
-            passwd      = None if is_honeypot else "".join(
-                random.choice(string.ascii_letters + string.digits) for _ in range(10))
+            is_target   = (ip == codename_ip and not codename_in_public)
+            passwd      = random_password()
             auth_user   = random.choice(["admin", "root", "dbadmin", "administrator", "deploy"])
             name        = f"priv-{last}"
+
+            home_message = (
+                "You are on the correct server.\n\n"
+                "The codename is hidden somewhere on this host.\n"
+                "Explore the filesystem carefully\n"
+                if is_target
+                else "This is not the correct server. Try another host."
+            )
 
             network[ip] = {
                 "name":         name,
@@ -1453,13 +1300,32 @@ class VirtualEnvironment:
                 "host_type":    host_type,
                 "latency":      round(random.uniform(0.4, 50.0), 2),
                 "banner":       _build_motd(name, os_choice),
-                "shell_hint":   "Authentication required." if not is_honeypot else "Access restricted.",
-                "home_message": "This is not the correct server. Try another host.",
-                "is_target":    False,
-                "codename":     "",
+                "shell_hint":   "Check the home directory for clues.",
+                "is_target":    is_target,
+                "home_message": home_message,
+                "codename":     codename if is_target else "",
                 "uptime_days":  random.randint(1, 400),
-                "kernel":       _rand_kernel(),
+                "kernel":       rand_kernel(),
                 "ssh_version":  f"SSH-2.0-OpenSSH_{random.choice(['8.9p1','9.2p1','9.6p1','8.4p1'])}",
             }
 
         self.network = network
+        self.rebuild_network_pwd()
+
+    def rebuild_network_pwd(self):
+        etc = self.root.children["etc"]
+
+        protected_hosts = []
+        for ip, host in self.network.items():
+            if host.get("password"):
+                protected_hosts.append(f"IP:{ip} - PWD:{host['password']}")
+
+        # overwrite existing node if it exists
+        etc.children["network_pwd"] = Node(
+            "network_pwd",
+            etc,
+            False,
+            "\n".join(protected_hosts) + "\n",
+            owner="root",
+            permissions="rw-------"
+        )

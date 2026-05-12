@@ -70,6 +70,7 @@ def run_connect(shell, args: list, commands: list = None) -> None:
         print("usage: connect [-p port] [-l user] <ip>")
         return
 
+    print("IP:", shell.env.network)
     if ip not in shell.env.network:
         # Simulate connection refused / no route
         time.sleep(random.uniform(0.05, 0.2))
@@ -160,7 +161,7 @@ def run_connect(shell, args: list, commands: list = None) -> None:
             if correct_pw is None:
                 # honeypot
                 time.sleep(random.uniform(0.3, 0.6))
-                print("Permission denied, please try again.")
+                print(f"Permission denied, please try again. {attempt} attempts left.")
                 if attempt == 3:
                     print(f"{auth_user}@{ip}: Permission denied (publickey,password).")
                     print(f"ssh: connect to host {ip} port {port}: Too many authentication failures")
@@ -186,10 +187,12 @@ def run_connect(shell, args: list, commands: list = None) -> None:
     new_env.network  = shell.env.network
     new_env.hostname = name
     new_env.user     = auth_user
-    new_env.vars["HOME"] = f"/home/{auth_user}"
-    new_env.vars["USER"] = auth_user
+    new_env.vars["HOME"]    = f"/home/{auth_user}"
+    new_env.vars["USER"]    = auth_user
+    new_env.challenge_level = shell.env.challenge_level
 
     # Populate realistic filesystem
+    print("host codename:", host)
     build_remote_filesystem(
         new_env, host, auth_user,
         codename=host.get("codename", ""),

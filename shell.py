@@ -1034,7 +1034,9 @@ class Shell:
 
     def cat(self, args: list) -> None:
         if not args:
-            print("usage: cat <file>"); return
+            print("usage: cat <file>")
+            self.env.last_exit_code = 1
+            return
         for path in args:
             try:
                 node = self.resolve_path(path)
@@ -1045,6 +1047,13 @@ class Shell:
             if node.is_dir:
                 print(f"cat: {path}: is a directory")
                 self.env.last_exit_code = 1
+                continue
+
+            if not self._has_permission(node, "r"):
+                print(f"cat: {path}: Permission denied")
+                self.env.last_exit_code = 1
+                continue
+
             else:
                 print(node.content, end="" if node.content.endswith("\n") else "\n")
                 self.env.last_exit_code = 0
@@ -1535,12 +1544,23 @@ class Shell:
 
     def chmod(self, args: list) -> None:
         if len(args) < 2:
-            print("usage: chmod <mode> <file>"); return
+            print("usage: chmod <mode> <file>")
+            self.env.last_exit_code = 1
+            return
+
         mode_str, path = args[0], args[1]
+
         try:
             node = self.resolve_path(path)
         except FileNotFoundError:
-            print(f"chmod: cannot access '{path}': No such file or directory"); return
+            print(f"chmod: cannot access '{path}': No such file or directory")
+            self.env.last_exit_code = 1
+            return
+
+        if self.env.user != node.owner and self.env.user != "root":
+            print(f"chmod: changing permissions denied: '{path}'")
+            self.env.last_exit_code = 1
+            return
 
         if re.fullmatch(r"[0-7]{3}", mode_str):
             p = ""
@@ -1553,7 +1573,9 @@ class Shell:
 
         m = re.fullmatch(r"([ugoa]*)([+\-=])([rwx]+)", mode_str)
         if not m:
-            print(f"chmod: invalid mode: {mode_str}"); return
+            print(f"chmod: invalid mode: {mode_str}")
+            self.env.last_exit_code = 1
+            return
 
         who, op, perms = m.group(1) or "a", m.group(2), m.group(3)
         if who == "a":
@@ -1591,6 +1613,27 @@ class Shell:
             print(f"chown: cannot access '{path}': No such file or directory")
             self.env.last_exit_code = 1
 
+    def _has_permission(self, node: Node, perm: str) -> bool:
+        """
+        perm: 'r', 'w', or 'x'
+        """
+
+        # root bypass
+        if self.env.user == "root":
+            return True
+
+        perms = node.permissions
+
+        # owner section
+        if self.env.user == node.owner:
+            idx = {"r": 0, "w": 1, "x": 2}
+            return perms[idx[perm]] != "-"
+
+        # group/others (simplified: use "others")
+        idx = {"r": 6, "w": 7, "x": 8}
+        return perms[idx[perm]] != "-"
+
+
     # =========================================================
     # HEAD / TAIL / WC helpers
     # =========================================================
@@ -1622,7 +1665,7 @@ class Shell:
         n       = self._flag_n(args)
         targets = self._get_file_args(args)
         if not targets:
-            text = sys.stdin.read() if not _sys.stdin.isatty() else ""
+            text = sys.stdin.read() if not sys.stdin.isatty() else ""
             print("\n".join(text.splitlines()[:n]))
             self.env.last_exit_code = 0
             return
@@ -1754,11 +1797,41 @@ class Shell:
             self.env.vars["USER"] = old_user
 
     def su_cmd(self, args: list) -> None:
-        target = args[0] if args else "root"
-        # In the virtual shell, su always succeeds (no real auth)
+        """
+        Switch user account (used to access codename.txt)
+        """
+        if not args:
+            print("su: missing username")
+            self.env.last_exit_code = 1
+            return
+
+        target = args[0]
+
+        # simple auth model (can expand later)
+        allowed_users = self.get_users()
+
+        if target not in allowed_users:
+            print("su: user does not exist")
+            self.env.last_exit_code = 1
+            return
+
+        # optional: restrict root switching not in use
+        if target == "root" and self.env.user != "root" and False:
+            print("su: authentication required")
+            self.env.last_exit_code = 1
+            return
+
+        home_path = f"/home/{target}"
+
         self.env.user = target
         self.env.vars["USER"] = target
-        self.env.vars["HOME"] = f"/home/{target}"
+        self.env.vars["HOME"] = home_path
+
+        try:
+            self.env.cwd = self.resolve_path(home_path)
+        except FileNotFoundError:
+            self.env.cwd = self.resolve_path("/")
+
         print(f"Switched to user: {target}")
         self.env.last_exit_code = 0
 
@@ -1789,6 +1862,20 @@ class Shell:
         for k, v in sorted(self.env.vars.items()):
             print(f"{k}={v}")
         self.env.last_exit_code = 0
+
+    def get_users(self) -> list[str]:
+        try:
+            passwd = self.resolve_path("/etc/passwd")
+        except FileNotFoundError:
+            return []
+
+        users = []
+
+        for line in passwd.content.splitlines():
+            if line.strip():
+                users.append(line.split(":")[0])
+
+        return users
 
     def printenv(self, args: list) -> None:
         if args:

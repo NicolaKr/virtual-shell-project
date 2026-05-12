@@ -8,7 +8,6 @@ from env import VirtualEnvironment, build_remote_filesystem
 from shell import Shell
 from completer import ShellCompleter
 from utils import decrypt_codename
-from commands.connect import run_connect
 
 CURRENT_CODENAME = None
 TASK_1_N_PUBLIC  = 5
@@ -22,13 +21,15 @@ def _build_env(codename: str, task_level: int | None,
     if task_level == 1:
         env = VirtualEnvironment(codename, TASK_1_N_PUBLIC, TASK_1_N_PRIVATE)
         env.setup_level1()
-        env.update_random_network(num_public=5, num_private=2)
+        env.update_random_network(num_public=TASK_1_N_PUBLIC, num_private=TASK_1_N_PRIVATE)
     elif task_level == 2:
-        env = VirtualEnvironment(codename, n_public, n_private)
+        env = VirtualEnvironment(codename, 1, 1)
         env.setup_level2()
-        env.update_random_network(num_public=305, num_private=5)
+        env.update_random_network(num_public=1, num_private=1, codename_in_public=False)
     elif task_level == 3:
         env = VirtualEnvironment(codename, n_public, n_private)
+        env.update_random_network(num_public=305, num_private=5, codename_in_public=True)
+
         env.setup_level3()
     else:
         env = VirtualEnvironment(codename, n_public, n_private)
@@ -173,7 +174,6 @@ def _step(shell, env, cmd: str, delay: float = 0.4, comment: str = None):
 
 def _step_remote(local_env, ip: str, steps: list, delay: float = 0.4):
     """Build a remote shell for the given IP and run (comment, cmd) steps inside it."""
-    from commands.connect import run_connect
 
     host      = local_env.network.get(ip, {})
     name      = host.get("name", ip)
@@ -284,10 +284,14 @@ def solution(task_level: int) -> None:
 
     elif task_level == 2:
         _banner("Level 2 Solution – Step by Step")
+        env, shell = _build_env(CURRENT_CODENAME, task_level=2)
+
         print("  (not yet implemented)")
 
     elif task_level == 3:
         _banner("Level 3 Solution – Step by Step")
+        env, shell = _build_env(CURRENT_CODENAME, task_level=3)
+
         print("  (not yet implemented)")
 
     else:
@@ -300,5 +304,5 @@ def solution(task_level: int) -> None:
 
 
 if __name__ == "__main__":
-    #main()
-    solution(task_level=1)
+    main(task_level=2)
+    #solution(task_level=1)
