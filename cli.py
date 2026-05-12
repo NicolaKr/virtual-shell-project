@@ -10,8 +10,11 @@ from completer import ShellCompleter
 from utils import decrypt_codename
 
 CURRENT_CODENAME = None
-TASK_1_N_PUBLIC  = 5
-TASK_1_N_PRIVATE = 2
+TASK_1_N_PUBLIC  = 1 # 5
+TASK_1_N_PRIVATE = 1 # 2
+
+TASK_2_N_PUBLIC  = 2
+TASK_2_N_PRIVATE = 5
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 
@@ -23,14 +26,13 @@ def _build_env(codename: str, task_level: int | None,
         env.setup_level1()
         env.update_random_network(num_public=TASK_1_N_PUBLIC, num_private=TASK_1_N_PRIVATE)
     elif task_level == 2:
-        env = VirtualEnvironment(codename, 1, 1)
+        env = VirtualEnvironment(codename, TASK_2_N_PRIVATE, TASK_2_N_PRIVATE)
         env.setup_level2()
-        env.update_random_network(num_public=1, num_private=1, codename_in_public=False)
+        env.update_random_network(num_public=TASK_2_N_PUBLIC, num_private=TASK_2_N_PRIVATE, codename_in_public=False)
     elif task_level == 3:
         env = VirtualEnvironment(codename, n_public, n_private)
-        env.update_random_network(num_public=305, num_private=5, codename_in_public=True)
-
         env.setup_level3()
+        env.update_random_network(num_public=305, num_private=5, codename_in_public=True)
     else:
         env = VirtualEnvironment(codename, n_public, n_private)
         env.build_default_home()
@@ -57,6 +59,7 @@ def _run_repl(shell, env, *, interactive: bool = True,
                 prompt = f"{env.user}@{env.hostname}:{path}$ "
                 print(prompt + line)
             try:
+                print("cmd:", line)
                 shell.run(line)
             except KeyboardInterrupt:
                 print("^C")
@@ -109,6 +112,7 @@ def _run_repl(shell, env, *, interactive: bool = True,
                 print("logout")
                 break
             try:
+                print("line", line)
                 shell.run(line)
             except KeyboardInterrupt:
                 print("^C")
@@ -172,7 +176,7 @@ def _step(shell, env, cmd: str, delay: float = 0.4, comment: str = None):
               silent=True, split_semicolons=False)
 
 
-def _step_remote(local_env, ip: str, steps: list, delay: float = 0.4):
+def _step_remote(local_env, ip: str, password: str, steps: list, delay: float = 0.4):
     """Build a remote shell for the given IP and run (comment, cmd) steps inside it."""
 
     host      = local_env.network.get(ip, {})
@@ -185,6 +189,8 @@ def _step_remote(local_env, ip: str, steps: list, delay: float = 0.4):
     new_env.user     = auth_user
     new_env.vars["HOME"] = f"/home/{auth_user}"
     new_env.vars["USER"] = auth_user
+
+    print("host target", host)
     build_remote_filesystem(
         new_env, host, auth_user,
         codename=host.get("codename", ""),
@@ -268,16 +274,19 @@ def solution(task_level: int) -> None:
             for part in ["home", env.user, "correct_ip.txt"]:
                 node = node.children[part]
             correct_ip = node.content.strip().splitlines()[0].strip()
-        except Exception:
+        except Exception as e:
+            print("Exception Error:", e)
             pass
 
         if correct_ip:
             print("correct_ip:", correct_ip)
-            _step_remote(env, correct_ip, [
+            _step_remote(env, correct_ip, None, [
+                ("hey", "ls"),
                 ("Step 6: User reads the hint.txt file and knows he needs to locate and go into the folder CodeName.",
-                 "cd \"$(find . -type d -name \"CodeName\" | head -n 1)\" "),
-                ("Step 7: User sees a readme which tells the file is hidden in this directory and therefore "
-                 "can find it via ls -a and read the codename.", "ls -a && cat .codename"),
+                 "cd \"$(find / -type d -name \"*CodeName*\" | head -n 1)\" "),
+                ("hey", "echo 3"),
+                #("Step 7: User sees a readme which tells the file is hidden in this directory and therefore "
+                # "can find it via ls -a and read the codename.", "ls -a && cat .codename.txt"),
             ])
 
         print(f"\n  ✓ Codename: {CURRENT_CODENAME}\n")
@@ -286,7 +295,79 @@ def solution(task_level: int) -> None:
         _banner("Level 2 Solution – Step by Step")
         env, shell = _build_env(CURRENT_CODENAME, task_level=2)
 
-        print("  (not yet implemented)")
+        _step(shell, env, "cat Task2.md",
+              comment="Step 1: read the mission briefing")
+
+        _step(shell, env, "cd /etc && ls -l",
+              comment=(
+                  "Step 2: Go to etc folder because network_pwd is stored there.\n"
+                  "  Check what permission it has. See that we can't read it."
+              ),
+              delay=0.6)
+
+
+        _step(shell, env,
+              "su root && cd etc &&  cat network_pwd && cd",
+              comment=(
+                  "Step 3: Switch to root user and read the script"
+              ),
+              delay=0.6)
+
+        _step(shell, env,
+              "while IFS= read -r line; do;"
+              "  ip=$(echo \"$line\" | awk -F'IP:' '{print $2}' | awk '{print $1}');"
+              "  pwd=$(echo \"$line\" | awk -F'PWD:' '{print $2}');"
+              "  output=$(ssh -q -y -P \"$pwd\" \"$ip\" \"cat readme.md\" | tail -n 1);"
+              "  if [ \"$output\" != \"This is not the correct server. Try another host.\" ]; then;"
+              "    echo \"$ip $pwd\" > /home/student/correct_ip.txt;"
+              "    break;"
+              "  fi;"
+              "done < /etc/network_pwd",
+              comment=(
+                  "Step 5: try each credential from network_pwd against every private host.\n"
+                  "  Parse the IP and password from each line with awk, then ssh in quietly\n"
+                  "  using -P to supply the password non-interactively.\n"
+                  "  When readme.md returns something other than the wrong-server message\n"
+                  "  we found the target — save the IP and password to correct_ip.txt."
+              ),
+              delay=0.8)
+
+        _step(shell, env, "cat /home/student/correct_ip.txt",
+              comment="Step 6: confirm the correct server IP and password")
+
+        _step(shell, env, "su student")
+
+
+        # Extract ip and pwd from /home/student/correct_ip.txt
+        # Content written by the loop: "<ip> <pwd>"
+        correct_ip = None
+        correct_pw = None
+        try:
+            node = shell.env.root
+            for part in ["home", "student", "correct_ip.txt"]:
+                node = node.children[part]
+            toks = node.content.strip().splitlines()[0].strip().split()
+            if len(toks) >= 2:
+                correct_ip, correct_pw = toks[0], toks[1]
+            elif len(toks) == 1:
+                correct_ip = toks[0]
+        except Exception as e:
+            print("exception E:", e)
+            pass
+
+
+        if correct_ip and correct_pw:
+            _step_remote(env, correct_ip, correct_pw, [
+                ("hey", "find / -type f -name '*code*' | head -n 1"),
+                ("hey2", "ls"),
+
+                # ("Step 7: Search for the file.", "dir=$(dirname $(find / -type f -name '*code*' | head -n 1)); cd \"$dir\""),
+                # ("Step 8: Change permission to read file.", "chmod +r codename.txt"),
+                # ("Step 9: Read the code!", "cat codename.txt"),
+            ])
+
+        print(f"\n  ✓ Codename: {CURRENT_CODENAME}\n")
+
 
     elif task_level == 3:
         _banner("Level 3 Solution – Step by Step")
@@ -299,10 +380,9 @@ def solution(task_level: int) -> None:
         return
 
     # Drop into interactive REPL so the student can keep exploring
-    # print(" \n\n # Solution complete — shell is yours. Type 'exit' to quit.\n")
-    # _run_repl(shell, env, interactive=True)
+    print(" \n\n # Solution complete — shell is yours. Type 'exit' to quit.\n")
+    _run_repl(shell, env, interactive=True)
 
 
 if __name__ == "__main__":
-    main(task_level=2)
-    #solution(task_level=1)
+    solution(task_level=1)

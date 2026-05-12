@@ -51,6 +51,31 @@ _FS: dict = {
         ],
         "tip": "After cd, run 'pwd' to confirm your new location.",
     },
+    "dirname": {
+        "desc": "Print the directory part of a path — everything up to the last /.",
+        "flags": [],
+        "examples": [
+            ("dirname /home/student/notes.txt",  "→ /home/student"),
+            ("dirname notes.txt",                "→ . (no slash = current dir)"),
+            ("dirname /etc/",                    "→ /"),
+            ('cd "$(dirname "$(find . -type f -name \'*code*\' | head -n 1)")"',
+             "cd into the directory that contains the first matching file"),
+        ],
+        "tip": (
+            "Combine with find + $() to jump straight to a file's parent:\n"
+            "  cd \"$(dirname \"$(find . -type f -name '*secret*' | head -n 1)\")\""
+        ),
+    },
+    "basename": {
+        "desc": "Print the filename part of a path — everything after the last /.",
+        "flags": [],
+        "examples": [
+            ("basename /home/student/notes.txt",        "→ notes.txt"),
+            ("basename /home/student/notes.txt .txt",   "→ notes  (strips suffix)"),
+            ("basename /home/student/",                 "→ student"),
+        ],
+        "tip": "Use basename to extract just the filename when looping over find results.",
+    },
     "cat": {
         "desc": "Print the contents of one or more files to the screen.",
         "flags": [],
@@ -523,7 +548,7 @@ def render_help(shell: "Shell", args: list | None) -> None:
         print("  Tip: type  help shell_script_commands  for scripting reference (if/for/while/pipes/read)")
         print("  Tip: scripting help is NOT a command — it's documentation\n")
         groups = {
-            "File System":  ["ls", "cd", "pwd", "cat", "nano", "mkdir", "touch", "rm", "cp", "mv",
+            "File System":  ["ls", "cd", "pwd", "dirname", "basename", "cat", "nano", "mkdir", "touch", "rm", "cp", "mv",
                               "grep", "find", "head", "tail", "wc", "sort", "uniq", "cut", "diff",
                               "chmod", "chown", "stat", "du", "df", "file"],
             "Text & Shell": ["echo", "printf", "export", "unset", "read", "alias", "type",

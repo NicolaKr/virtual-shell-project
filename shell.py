@@ -133,6 +133,8 @@ class Shell:
             Command("ls",        "ls [-la] [path]",             "list directory contents",          self.ls),
             Command("cd",        "cd <path>",                   "change directory",                 self.cd),
             Command("pwd",       "pwd",                         "print working directory",          self.pwd),
+            Command("dirname",   "dirname <path>",              "strip last component of path",     self.dirname),
+            Command("basename",  "basename <path> [suffix]",    "strip directory from path",        self.basename),
             Command("cat",       "cat <file>",                  "print file contents",              self.cat),
             Command("nano",      "nano <file>",                 "edit a file interactively",        self.nano),
             Command("mkdir",     "mkdir [-p] <dir>",            "create a directory",               self.mkdir),
@@ -825,9 +827,52 @@ class Shell:
     # =========================================================
 
     def _expand_vars(self, text: str) -> str:
-        """Expand shell variables, skipping content inside single quotes."""
-        # Split on single-quoted regions; only expand outside them.
-        # e.g.  echo "hello $NAME 'keep $NF as-is' done"
+        """Expand shell variables and $() command substitutions,
+        skipping content inside single quotes."""
+
+        # ── $() command substitution — depth-aware, handles nesting ────────
+        def _expand_cmd_subst(s: str) -> str:
+            result = []
+            i = 0
+            while i < len(s):
+                if s[i] == "'" :
+                    # Single-quoted region — copy verbatim until closing '
+                    j = i + 1
+                    while j < len(s) and s[j] != "'":
+                        j += 1
+                    result.append(s[i:j + 1])
+                    i = j + 1
+                elif s[i] == "$" and i + 1 < len(s) and s[i + 1] == "(":
+                    # Skip $(( arithmetic )) — not supported, leave as-is
+                    if i + 2 < len(s) and s[i + 2] == "(":
+                        result.append(s[i]); i += 1; continue
+                    # Find matching closing ) respecting depth and quotes
+                    depth, in_q, j = 0, None, i + 1
+                    while j < len(s):
+                        c = s[j]
+                        if in_q:
+                            if c == in_q: in_q = None
+                        elif c in ('"', "'"):
+                            in_q = c
+                        elif c == "(":
+                            depth += 1
+                        elif c == ")":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        j += 1
+                    inner = s[i + 2:j]
+                    # Run the inner command and capture output
+                    output = self._run_single(inner.strip(), capture=True) or ""
+                    result.append(output.strip())
+                    i = j + 1
+                else:
+                    result.append(s[i]); i += 1
+            return "".join(result)
+
+        text = _expand_cmd_subst(text)
+
+        # ── Variable expansion, skipping single-quoted regions ───────────
         parts = text.split("'")
         expanded = []
         for i, part in enumerate(parts):
@@ -1030,6 +1075,30 @@ class Shell:
 
     def pwd(self, args: list) -> None:
         print(self.get_path(self.env.cwd))
+        self.env.last_exit_code = 0
+
+    def dirname(self, args: list) -> None:
+        if not args:
+            print("usage: dirname <path>"); return
+        for path in args:
+            # Strip trailing slashes, then return everything before the last /
+            p = path.rstrip("/")
+            if "/" not in p:
+                print(".")
+            else:
+                parent = p.rsplit("/", 1)[0]
+                print(parent if parent else "/")
+        self.env.last_exit_code = 0
+
+    def basename(self, args: list) -> None:
+        if not args:
+            print("usage: basename <path> [suffix]"); return
+        path   = args[0]
+        suffix = args[1] if len(args) > 1 else ""
+        name   = path.rstrip("/").rsplit("/", 1)[-1]
+        if suffix and name.endswith(suffix):
+            name = name[:-len(suffix)]
+        print(name)
         self.env.last_exit_code = 0
 
     def cat(self, args: list) -> None:

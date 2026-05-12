@@ -42,8 +42,9 @@ def run_connect(shell, args: list, commands: list = None) -> None:
     port      = 22
     req_user  = None
     i = 0
-    auto_yes = False
-    quiet    = False
+    auto_yes  = False
+    quiet     = False
+    password  = None
     while i < len(args):
         if args[i] == "-p" and i + 1 < len(args):
             try:
@@ -53,6 +54,9 @@ def run_connect(shell, args: list, commands: list = None) -> None:
             i += 2
         elif args[i] == "-l" and i + 1 < len(args):
             req_user = args[i + 1]
+            i += 2
+        elif args[i] == "-P" and i + 1 < len(args):
+            password = args[i + 1]
             i += 2
         elif args[i] == "-y":
             auto_yes = True
@@ -70,7 +74,7 @@ def run_connect(shell, args: list, commands: list = None) -> None:
         print("usage: connect [-p port] [-l user] <ip>")
         return
 
-    print("IP:", shell.env.network)
+    # print("DEBUG IP:", shell.env.network)
     if ip not in shell.env.network:
         # Simulate connection refused / no route
         time.sleep(random.uniform(0.05, 0.2))
@@ -145,42 +149,54 @@ def run_connect(shell, args: list, commands: list = None) -> None:
         authenticated = True
 
     else:
-        print(f"debug1: Authenticating to {ip}:{port} as '{auth_user}'")
-        time.sleep(0.04)
-        print(f"debug1: Trying private key: /home/student/.ssh/id_ed25519")
-        time.sleep(0.06)
-        print(f"debug1: No such identity: /home/student/.ssh/id_ed25519 (no such file)")
-        print(f"debug1: Next authentication method: password")
+        if not quiet:
+            print(f"debug1: Authenticating to {ip}:{port} as '{auth_user}'")
+            time.sleep(0.04)
+            print(f"debug1: Trying private key: /home/student/.ssh/id_ed25519")
+            time.sleep(0.06)
+            print(f"debug1: No such identity: /home/student/.ssh/id_ed25519 (no such file)")
+            print(f"debug1: Next authentication method: password")
 
-        for attempt in range(1, 4):
-            try:
-                entered = input(f"{auth_user}@{ip}'s password: ")
-            except EOFError:
-                entered = ""
-
-            if correct_pw is None:
-                # honeypot
-                time.sleep(random.uniform(0.3, 0.6))
-                print(f"Permission denied, please try again. {attempt} attempts left.")
-                if attempt == 3:
-                    print(f"{auth_user}@{ip}: Permission denied (publickey,password).")
-                    print(f"ssh: connect to host {ip} port {port}: Too many authentication failures")
-                continue
-
-            if entered == correct_pw:
-                time.sleep(random.uniform(0.08, 0.15))
-                print(f"debug1: Authentication succeeded (password).")
+        # -P flag: use supplied password non-interactively
+        if password is not None:
+            if password == correct_pw:
+                if not quiet:
+                    print(f"debug1: Authentication succeeded (password).")
                 shell.env.authenticated.add(ip)
                 authenticated = True
-                break
+            else:
+                print(f"{auth_user}@{ip}: Permission denied (publickey,password).")
+                shell.env.last_exit_code = 255
+                return
+        else:
+            for attempt in range(1, 4):
+                try:
+                    entered = input(f"{auth_user}@{ip}'s password: ")
+                except EOFError:
+                    entered = ""
 
-            time.sleep(random.uniform(0.2, 0.4))
-            print("Permission denied, please try again.")
+                if correct_pw is None:
+                    time.sleep(random.uniform(0.3, 0.6))
+                    print(f"Permission denied, please try again. {attempt} attempts left.")
+                    if attempt == 3:
+                        print(f"{auth_user}@{ip}: Permission denied (publickey,password).")
+                        print(f"ssh: connect to host {ip} port {port}: Too many authentication failures")
+                    continue
 
-        if not authenticated:
-            print(f"{auth_user}@{ip}: Permission denied (publickey,password).")
-            shell.env.last_exit_code = 255
-            return
+                if entered == correct_pw:
+                    time.sleep(random.uniform(0.08, 0.15))
+                    print(f"debug1: Authentication succeeded (password).")
+                    shell.env.authenticated.add(ip)
+                    authenticated = True
+                    break
+
+                time.sleep(random.uniform(0.2, 0.4))
+                print("Permission denied, please try again.")
+
+            if not authenticated:
+                print(f"{auth_user}@{ip}: Permission denied (publickey,password).")
+                shell.env.last_exit_code = 255
+                return
 
     # --- Build remote environment ---
     new_env          = VirtualEnvironment()
@@ -192,7 +208,7 @@ def run_connect(shell, args: list, commands: list = None) -> None:
     new_env.challenge_level = shell.env.challenge_level
 
     # Populate realistic filesystem
-    print("host codename:", host)
+    # print("DEBUG host codename:", host)
     build_remote_filesystem(
         new_env, host, auth_user,
         codename=host.get("codename", ""),
@@ -300,17 +316,17 @@ HELP = {
             "commands on it as if you were sitting in front of it."
         ),
         "flags": [
-            ("-p <port>", "connect on a non-standard port (default is 22)"),
-            ("-l <user>", "log in as a different username"),
-            ("-y",        "auto-accept host key (skip fingerprint prompt)"),
-            ("-q",        "quiet mode: suppress all debug/banner output (implies -y)"),
+            ("-p <port>",     "connect on a non-standard port (default is 22)"),
+            ("-l <user>",     "log in as a different username"),
+            ("-P <password>", "supply password directly (non-interactive)"),
+            ("-y",            "auto-accept host key (skip fingerprint prompt)"),
+            ("-q",            "quiet mode: suppress all debug/banner output"),
         ],
         "examples": [
-            ("ssh 192.168.0.42",                     "connect to a public host (no password)"),
-            ("ssh 192.168.0.77",                     "connect – will prompt for password if required"),
-            ("ssh -l admin 192.168.0.77",            "log in as user 'admin'"),
-            ("ssh -p 2222 192.168.0.77",             "connect on port 2222 instead of 22"),
-            ("ssh -q 192.168.0.42 'cat readme.md'",  "quietly run a command and get only its output"),
+            ("ssh 192.168.0.42",                              "connect to a public host"),
+            ("ssh -y 192.168.0.77",                           "connect, auto-accept host key"),
+            ("ssh -P s3cr3t -y 192.168.0.77",                 "connect with password supplied directly"),
+            ("ssh -q -y -P s3cr3t 192.168.0.77 'cat readme.md'", "quietly run a remote command"),
         ],
         "tip": (
             "Workflow:\n"

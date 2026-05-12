@@ -10,8 +10,6 @@ import base64
 import random
 import string
 import datetime
-from typing import List, Optional
-from env import Node
 
 # XOR key used for codename obfuscation (must match in cli.py)
 _KEY = 120
@@ -187,51 +185,6 @@ def rand_crontab(user: str) -> str:
     ]
     header = f"# Crontab for {user}\n# m h dom mon dow command\n"
     return header + "\n".join(random.sample(jobs, random.randint(2, 4)))
-
-
-def collect_candidate_dirs(
-    root: Node,
-    user_home: Node,
-    extra_roots: Optional[List[Node]] = None,
-) -> List[Node]:
-    """
-    Collect potential directories for random placement of files/folders.
-    """
-
-    # Always include user home
-    candidates = [user_home]
-
-    # Include 1-level deep directories in home
-    for child in user_home.children.values():
-        if child.is_dir:
-            candidates.append(child)
-
-    # Standard system directories
-    for name in ("opt", "tmp"):
-        node = root.children.get(name)
-        if node and node.is_dir:
-            candidates.append(node)
-
-    # Optional additional roots (extensibility hook)
-    if extra_roots:
-        for node in extra_roots:
-            if node and node.is_dir:
-                candidates.append(node)
-
-    return candidates
-
-
-def choose_random_directory(candidates: List["Node"]) -> "Node":
-    """
-    Select a random directory from a list of candidates.
-
-    Raises:
-        ValueError if the list is empty.
-    """
-    if not candidates:
-        raise ValueError("No valid candidate directories available.")
-
-    return random.choice(candidates)
 
 
 def encrypt_codename(plain: str) -> str:
